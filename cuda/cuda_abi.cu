@@ -635,11 +635,16 @@ void squid_launch_mega_local_sconv_prep_store(
 
 void squid_launch_relative_attention_gated(
     const float* qrgs, const void* rel_proj, const void* k_cache, const void* v_cache,
-    const void* k_scale, const void* v_scale, uint8_t kv_fmt, float* split_buf,
+    const void* k_scale, const void* v_scale,
+    const void* k_bulk_cache, const void* v_bulk_cache,
+    const void* k_bulk_scale, const void* v_bulk_scale, int32_t bulk_kv_cap,
+    uint8_t kv_fmt, float* split_buf,
     float* out_gated, void* out_gated_h, int32_t kv_cap, int32_t window, int32_t B, const int32_t* d_pos, void* stream) {
     launch_relative_attention_gated(
         qrgs, static_cast<const __nv_bfloat16*>(rel_proj), k_cache, v_cache,
         static_cast<const __half*>(k_scale), static_cast<const __half*>(v_scale),
+        k_bulk_cache, v_bulk_cache,
+        static_cast<const __half*>(k_bulk_scale), static_cast<const __half*>(v_bulk_scale), bulk_kv_cap,
         static_cast<KVFormat>(kv_fmt), split_buf, out_gated, static_cast<__half*>(out_gated_h),
         kv_cap, window, B, d_pos, static_cast<cudaStream_t>(stream));
 }
@@ -955,11 +960,14 @@ void squid_launch_prefill_flash_attn_tc(
     const float* qrgs, const void* rel_proj,
     const void* k_cache, const void* v_cache,
     const void* k_scale, const void* v_scale,
+    const void* k_bulk_cache, const void* v_bulk_cache,
+    const void* k_bulk_scale, const void* v_bulk_scale, int32_t bulk_kv_cap,
     uint8_t kv_fmt, void* out_gated_h,
     int32_t kv_cap, int32_t window, int32_t B, const int32_t* d_pos, void* stream) {
     launch_prefill_flash_attn_tc(
         qrgs, static_cast<const __nv_bfloat16*>(rel_proj),
         k_cache, v_cache, static_cast<const __half*>(k_scale), static_cast<const __half*>(v_scale),
+        k_bulk_cache, v_bulk_cache, static_cast<const __half*>(k_bulk_scale), static_cast<const __half*>(v_bulk_scale), bulk_kv_cap,
         static_cast<KVFormat>(kv_fmt), static_cast<__half*>(out_gated_h),
         kv_cap, window, B, d_pos, static_cast<cudaStream_t>(stream));
 }

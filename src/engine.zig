@@ -148,6 +148,7 @@ pub const Engine = struct {
     context_tokens_max: u32 = 0,
     use_graphs: bool = true,
     kv_format: constants.KVFormat = .fp8,
+    share_loop_kv: bool = false,
     current_position: i32 = 0,
     schedule: [constants.visit_count]constants.VisitInfo = undefined,
 
@@ -296,6 +297,7 @@ pub const Engine = struct {
         context_tokens_max: u32,
         use_graphs: bool,
         kv_format: constants.KVFormat,
+        share_loop_kv_req: bool,
     ) void {
         tiger.assert(context_tokens_max >= 64);
         tiger.assert(self.arena.base_ptr == null);
@@ -304,6 +306,7 @@ pub const Engine = struct {
         self.context_tokens_max = context_tokens_max;
         self.use_graphs = use_graphs;
         self.kv_format = kv_format;
+        self.share_loop_kv = share_loop_kv_req and (context_tokens_max > constants.swa_window_tokens + 64);
         self.schedule = constants.build_visit_schedule();
 
         tiger.assert_cuda(cuda.squid_cuda_stream_create(&self.stream));
@@ -321,6 +324,7 @@ pub const Engine = struct {
             &self.schedule,
             context_tokens_max,
             kv_format,
+            self.share_loop_kv,
             has_dspark,
             expert_groups_bytes,
         );
@@ -330,7 +334,7 @@ pub const Engine = struct {
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
             const is_glob: bool = self.schedule[vi].is_global;
-            const cap: u32 = if (is_glob) context_tokens_max else (constants.swa_window_tokens + prefill_local_attn_sub);
+            const cap: u32 = visit_kv_cap(&self.schedule, vi, context_tokens_max, self.share_loop_kv);
             const vfmt: constants.KVFormat = if (is_glob) kv_format else .bf16;
             self.kv_cap[vi] = @intCast(cap);
             self.alloc_kv_pair(cap, vfmt, &self.k_cache[vi], &self.v_cache[vi], &self.k_scale[vi], &self.v_scale[vi]);
@@ -485,8 +489,8 @@ pub const Engine = struct {
 
         const rt_gib: f64 = @as(f64, @floatFromInt(self.arena.capacity_bytes)) / (1024.0 * 1024.0 * 1024.0);
         tiger.print_stdout(
-            "[engine] Initialized max_ctx={d} | kv={s} | runtime VRAM={d:.2} GiB (1 arena, {d} slices) | graphs={s}\n",
-            .{ context_tokens_max, kv_format.name(), rt_gib, self.arena.allocation_count, if (use_graphs) "on" else "off" },
+            "[engine] Initialized max_ctx={d} | kv={s}{s} | runtime VRAM={d:.2} GiB (1 arena, {d} slices) | graphs={s}\n",
+            .{ context_tokens_max, kv_format.name(), if (self.share_loop_kv) " (share-loop-kv)" else "", rt_gib, self.arena.allocation_count, if (use_graphs) "on" else "off" },
         );
         self.reset();
     }
@@ -578,8 +582,11 @@ pub const Engine = struct {
         var total: usize = 0;
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
-            if (!self.schedule[vi].is_global) {
-                total += 2 * @as(usize, @intCast(self.kv_cap[vi])) * constants.kv_dim * 2;
+            const is_shared_tail = self.share_loop_kv and is_shared_loop_global_visit(vi);
+            if (!self.schedule[vi].is_global or is_shared_tail) {
+                const vfmt: constants.KVFormat = if (is_shared_tail) self.kv_format else .bf16;
+                const sz = global_kv_bytes_for_tokens(vfmt, @intCast(self.kv_cap[vi]));
+                total += 2 * sz.data + 2 * sz.scale;
             }
             total += 2 * constants.sconv_ring_slots * constants.kv_dim * 4;
             total += 2 * constants.sconv_ring_slots * constants.hidden_dim * 4;
@@ -610,7 +617,7 @@ pub const Engine = struct {
         var total: usize = 0;
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
-            if (self.schedule[vi].is_global) {
+            if (self.schedule[vi].is_global and !(self.share_loop_kv and is_shared_loop_global_visit(vi))) {
                 total += 2 * sz.data + 2 * sz.scale;
             }
         }
@@ -628,12 +635,20 @@ pub const Engine = struct {
 
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
-            if (!self.schedule[vi].is_global) {
-                const kv_bytes: usize = @as(usize, @intCast(self.kv_cap[vi])) * constants.kv_dim * 2;
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.k_cache[vi].?, kv_bytes, self.stream));
-                off += kv_bytes;
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.v_cache[vi].?, kv_bytes, self.stream));
-                off += kv_bytes;
+            const is_shared_tail = self.share_loop_kv and is_shared_loop_global_visit(vi);
+            if (!self.schedule[vi].is_global or is_shared_tail) {
+                const vfmt: constants.KVFormat = if (is_shared_tail) self.kv_format else .bf16;
+                const sz = global_kv_bytes_for_tokens(vfmt, @intCast(self.kv_cap[vi]));
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.k_cache[vi].?, sz.data, self.stream));
+                off += sz.data;
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.v_cache[vi].?, sz.data, self.stream));
+                off += sz.data;
+                if (sz.scale > 0) {
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.k_scale[vi].?, sz.scale, self.stream));
+                    off += sz.scale;
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.v_scale[vi].?, sz.scale, self.stream));
+                    off += sz.scale;
+                }
             }
             const kv_ring_bytes: usize = constants.sconv_ring_slots * constants.kv_dim * 4;
             const h_ring_bytes: usize = constants.sconv_ring_slots * constants.hidden_dim * 4;
@@ -676,12 +691,20 @@ pub const Engine = struct {
 
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
-            if (!self.schedule[vi].is_global) {
-                const kv_bytes: usize = @as(usize, @intCast(self.kv_cap[vi])) * constants.kv_dim * 2;
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.k_cache[vi].?, @ptrCast(src[off..].ptr), kv_bytes, self.stream));
-                off += kv_bytes;
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.v_cache[vi].?, @ptrCast(src[off..].ptr), kv_bytes, self.stream));
-                off += kv_bytes;
+            const is_shared_tail = self.share_loop_kv and is_shared_loop_global_visit(vi);
+            if (!self.schedule[vi].is_global or is_shared_tail) {
+                const vfmt: constants.KVFormat = if (is_shared_tail) self.kv_format else .bf16;
+                const sz = global_kv_bytes_for_tokens(vfmt, @intCast(self.kv_cap[vi]));
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.k_cache[vi].?, @ptrCast(src[off..].ptr), sz.data, self.stream));
+                off += sz.data;
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.v_cache[vi].?, @ptrCast(src[off..].ptr), sz.data, self.stream));
+                off += sz.data;
+                if (sz.scale > 0) {
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.k_scale[vi].?, @ptrCast(src[off..].ptr), sz.scale, self.stream));
+                    off += sz.scale;
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.v_scale[vi].?, @ptrCast(src[off..].ptr), sz.scale, self.stream));
+                    off += sz.scale;
+                }
             }
             const kv_ring_bytes: usize = constants.sconv_ring_slots * constants.kv_dim * 4;
             const h_ring_bytes: usize = constants.sconv_ring_slots * constants.hidden_dim * 4;
@@ -720,7 +743,7 @@ pub const Engine = struct {
 
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
-            if (!self.schedule[vi].is_global) continue;
+            if (!self.schedule[vi].is_global or (self.share_loop_kv and is_shared_loop_global_visit(vi))) continue;
             if (save_d2h) {
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(buf[off..].ptr), self.k_cache[vi].?, sz.data, self.stream));
                 off += sz.data;
@@ -1530,6 +1553,8 @@ pub const Engine = struct {
                     &self.p_pos_vec[0],
                     self.stream,
                 );
+                const share_bulk: bool = self.share_loop_kv and is_shared_loop_global_visit(vi);
+                const bulk_vi: u32 = shared_bulk_visit_idx(vi);
                 cuda.squid_launch_prefill_flash_attn_tc(
                     self.p_qrgs,
                     lw.rel_logits_proj.?,
@@ -1537,6 +1562,11 @@ pub const Engine = struct {
                     self.v_cache[vi].?,
                     self.k_scale[vi],
                     self.v_scale[vi],
+                    if (share_bulk) self.k_cache[bulk_vi] else null,
+                    if (share_bulk) self.v_cache[bulk_vi] else null,
+                    if (share_bulk) self.k_scale[bulk_vi] else null,
+                    if (share_bulk) self.v_scale[bulk_vi] else null,
+                    if (share_bulk) self.kv_cap[bulk_vi] else 0,
                     @intFromEnum(self.kv_format),
                     self.p_attn_gated_h,
                     self.kv_cap[vi],
@@ -1580,6 +1610,11 @@ pub const Engine = struct {
                         self.v_cache[vi].?,
                         null,
                         null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        0,
                         @intFromEnum(constants.KVFormat.bf16),
                         offset_f16_ptr(self.p_attn_gated_h, off * constants.query_dim),
                         self.kv_cap[vi],
@@ -2299,6 +2334,8 @@ pub const Engine = struct {
                 );
             }
 
+            const share_bulk: bool = v.is_global and self.share_loop_kv and is_shared_loop_global_visit(vi);
+            const bulk_vi: u32 = shared_bulk_visit_idx(vi);
             cuda.squid_launch_relative_attention_gated(
                 self.qrgs,
                 lw.rel_logits_proj.?,
@@ -2306,6 +2343,11 @@ pub const Engine = struct {
                 self.v_cache[vi].?,
                 self.k_scale[vi],
                 self.v_scale[vi],
+                if (share_bulk) self.k_cache[bulk_vi] else null,
+                if (share_bulk) self.v_cache[bulk_vi] else null,
+                if (share_bulk) self.k_scale[bulk_vi] else null,
+                if (share_bulk) self.v_scale[bulk_vi] else null,
+                if (share_bulk) self.kv_cap[bulk_vi] else 0,
                 if (v.is_global) @intFromEnum(self.kv_format) else @intFromEnum(constants.KVFormat.bf16),
                 self.split_buf,
                 if (use_half_dense) null else self.attn_gated,
@@ -2649,10 +2691,34 @@ pub const Engine = struct {
     }
 };
 
+fn is_shared_loop_global_visit(vi: u32) bool {
+    return vi == 11 or vi == 23 or vi == 17 or vi == 29;
+}
+
+fn shared_bulk_visit_idx(vi: u32) u32 {
+    return switch (vi) {
+        11, 23 => 35,
+        17, 29 => 41,
+        else => vi,
+    };
+}
+
+fn visit_kv_cap(
+    schedule: *const [constants.visit_count]constants.VisitInfo,
+    vi: u32,
+    context_tokens_max: u32,
+    share_loop_kv: bool,
+) u32 {
+    if (!schedule[vi].is_global) return constants.swa_window_tokens + prefill_local_attn_sub;
+    if (share_loop_kv and is_shared_loop_global_visit(vi)) return @min(context_tokens_max, constants.swa_window_tokens + 64);
+    return context_tokens_max;
+}
+
 fn compute_runtime_vram_bytes(
     schedule: *const [constants.visit_count]constants.VisitInfo,
     context_tokens_max: u32,
     kv_format: constants.KVFormat,
+    share_loop_kv: bool,
     has_dspark: bool,
     expert_groups_bytes: u64,
 ) u64 {
@@ -2662,7 +2728,7 @@ fn compute_runtime_vram_bytes(
     var vi: u32 = 0;
     while (vi < constants.visit_count) : (vi += 1) {
         const is_glob = schedule[vi].is_global;
-        const cap: u32 = if (is_glob) context_tokens_max else (constants.swa_window_tokens + prefill_local_attn_sub);
+        const cap: u32 = visit_kv_cap(schedule, vi, context_tokens_max, share_loop_kv);
         const vfmt: constants.KVFormat = if (is_glob) kv_format else .bf16;
         total += constants.kv_cache_pair_vram_bytes(cap, vfmt);
         total += 2 * tiger.align_up_u64(constants.sconv_ring_slots * constants.kv_dim * 4, a);

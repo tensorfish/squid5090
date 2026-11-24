@@ -238,6 +238,11 @@ void launch_relative_attention_gated(
     const void* v_cache,                // [cap, KV_DIM] (BF16/FP8) or [cap, KV_DIM/2] (Q4)
     const __half* k_scale,              // optional: FP8 [cap, 8], Q4 [cap, 16]
     const __half* v_scale,              // optional: FP8 [cap, 8], Q4 [cap, 16]
+    const void* k_bulk_cache,           // optional shared last-loop bulk KV for [0 .. pos-1023)
+    const void* v_bulk_cache,
+    const __half* k_bulk_scale,
+    const __half* v_bulk_scale,
+    int bulk_kv_cap,
     KVFormat kv_fmt,
     float* split_buf,                   // [600000] floats scratch for global Split-K partials
     float* out_gated,                   // [B, 3072]
@@ -559,6 +564,11 @@ void launch_prefill_flash_attn_tc(
     const void* v_cache,
     const __half* k_scale,
     const __half* v_scale,
+    const void* k_bulk_cache,
+    const void* v_bulk_cache,
+    const __half* k_bulk_scale,
+    const __half* v_bulk_scale,
+    int bulk_kv_cap,
     KVFormat kv_fmt,
     __half* out_gated_h,
     int kv_cap,

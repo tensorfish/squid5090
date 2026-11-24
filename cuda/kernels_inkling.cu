@@ -2566,13 +2566,20 @@ static void dispatch_tc_attn_b(
     const float* qrgs, const __nv_bfloat16* rel_proj,
     const void* k_cache, const void* v_cache,
     const __half* k_scale, const __half* v_scale,
+    const void* k_bulk, const void* v_bulk,
+    const __half* ks_bulk, const __half* vs_bulk, int bulk_cap,
     float* split_buf, float* out_gated, __half* out_gated_h,
     int kv_cap, int window, const int32_t* d_pos, cudaStream_t stream) {
     constexpr int BULK_THREADS  = (GQA_RATIO * B_CONST > 16) ? 128 : 64;
     constexpr int LOCAL_THREADS = (GQA_RATIO * B_CONST > 16) ? 256 : 128;
     if (window == 0) {
+        const void* bk = k_bulk ? k_bulk : k_cache;
+        const void* bv = v_bulk ? v_bulk : v_cache;
+        const __half* bks = k_bulk ? ks_bulk : k_scale;
+        const __half* bvs = v_bulk ? vs_bulk : v_scale;
+        int bcap = k_bulk ? bulk_cap : kv_cap;
         global_attn_bulk_splitk_kernel<KV_FMT, B_CONST><<<dim3(NUM_KV_HEADS, KV_SPLIT_K), BULK_THREADS, 0, stream>>>(
-            qrgs, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos, split_buf);
+            qrgs, bk, bv, bks, bvs, bcap, d_pos, split_buf);
     }
     local_tail_attn_tc_kernel<KV_FMT, B_CONST><<<dim3(NUM_KV_HEADS, KV_LOCAL_SPLITS), LOCAL_THREADS, 0, stream>>>(
         qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, kv_cap, window, d_pos, split_buf);
@@ -2585,18 +2592,20 @@ static void dispatch_relative_attention_fmt(
     const float* qrgs, const __nv_bfloat16* rel_proj,
     const void* k_cache, const void* v_cache,
     const __half* k_scale, const __half* v_scale,
+    const void* k_bulk, const void* v_bulk,
+    const __half* ks_bulk, const __half* vs_bulk, int bulk_cap,
     float* split_buf, float* out_gated, __half* out_gated_h,
     int kv_cap, int window, int B, const int32_t* d_pos, cudaStream_t stream) {
     if (split_buf != nullptr) {
         switch (B) {
-            case 1: dispatch_tc_attn_b<KV_FMT, 1>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 2: dispatch_tc_attn_b<KV_FMT, 2>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 3: dispatch_tc_attn_b<KV_FMT, 3>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 4: dispatch_tc_attn_b<KV_FMT, 4>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 5: dispatch_tc_attn_b<KV_FMT, 5>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 6: dispatch_tc_attn_b<KV_FMT, 6>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 7: dispatch_tc_attn_b<KV_FMT, 7>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 8: dispatch_tc_attn_b<KV_FMT, 8>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
+            case 1: dispatch_tc_attn_b<KV_FMT, 1>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk, v_bulk, ks_bulk, vs_bulk, bulk_cap, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
+            case 2: dispatch_tc_attn_b<KV_FMT, 2>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk, v_bulk, ks_bulk, vs_bulk, bulk_cap, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
+            case 3: dispatch_tc_attn_b<KV_FMT, 3>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk, v_bulk, ks_bulk, vs_bulk, bulk_cap, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
+            case 4: dispatch_tc_attn_b<KV_FMT, 4>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk, v_bulk, ks_bulk, vs_bulk, bulk_cap, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
+            case 5: dispatch_tc_attn_b<KV_FMT, 5>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk, v_bulk, ks_bulk, vs_bulk, bulk_cap, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
+            case 6: dispatch_tc_attn_b<KV_FMT, 6>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk, v_bulk, ks_bulk, vs_bulk, bulk_cap, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
+            case 7: dispatch_tc_attn_b<KV_FMT, 7>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk, v_bulk, ks_bulk, vs_bulk, bulk_cap, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
+            case 8: dispatch_tc_attn_b<KV_FMT, 8>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk, v_bulk, ks_bulk, vs_bulk, bulk_cap, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
         }
         return;
     }
@@ -2608,14 +2617,16 @@ void launch_relative_attention_gated(
     const float* qrgs, const __nv_bfloat16* rel_proj,
     const void* k_cache, const void* v_cache,
     const __half* k_scale, const __half* v_scale,
+    const void* k_bulk_cache, const void* v_bulk_cache,
+    const __half* k_bulk_scale, const __half* v_bulk_scale, int bulk_kv_cap,
     KVFormat kv_fmt, float* split_buf, float* out_gated, __half* out_gated_h,
     int kv_cap, int window, int B, const int32_t* d_pos, cudaStream_t stream) {
     if (kv_fmt == KVFormat::FP8) {
-        dispatch_relative_attention_fmt<1>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, d_pos, stream);
+        dispatch_relative_attention_fmt<1>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, split_buf, out_gated, out_gated_h, kv_cap, window, B, d_pos, stream);
     } else if (kv_fmt == KVFormat::Q4) {
-        dispatch_relative_attention_fmt<2>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, d_pos, stream);
+        dispatch_relative_attention_fmt<2>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, split_buf, out_gated, out_gated_h, kv_cap, window, B, d_pos, stream);
     } else {
-        dispatch_relative_attention_fmt<0>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, d_pos, stream);
+        dispatch_relative_attention_fmt<0>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, split_buf, out_gated, out_gated_h, kv_cap, window, B, d_pos, stream);
     }
 }
 

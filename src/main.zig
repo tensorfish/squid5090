@@ -51,6 +51,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var use_graphs: bool = true;
     var use_prompt_lookup: bool = true;
     var embed_on_host: bool = false;
+    var share_loop_kv: bool = false;
+    if (tiger.getenv("SQUID_SHARE_LOOP_KV")) |skv| {
+        if (std.mem.eql(u8, std.mem.span(skv), "1")) share_loop_kv = true;
+    }
     var raw_prompt: bool = false;
     var raw_thinking: bool = false;
     var keep_history_thinking: bool = false;
@@ -136,6 +140,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             ctx = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 8192;
         } else if (std.mem.eql(u8, arg, "--embed-host")) {
             embed_on_host = true;
+        } else if (std.mem.eql(u8, arg, "--share-loop-kv")) {
+            share_loop_kv = true;
         } else if (std.mem.eql(u8, arg, "--no-graph")) {
             use_graphs = false;
         } else if (std.mem.eql(u8, arg, "--no-prompt-lookup")) {
@@ -265,7 +271,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     defer model_weights.deinit();
 
     var engine: engine_mod.Engine = .{};
-    engine.init(&model_weights, ctx, use_graphs, kv_format);
+    engine.init(&model_weights, ctx, use_graphs, kv_format, share_loop_kv);
     engine.spec_threshold = spec_threshold;
     engine.use_prompt_lookup = use_prompt_lookup;
     engine.sample_params = .{
@@ -668,12 +674,12 @@ fn print_usage() void {
     tiger.write_fd_all(2,
         "squid5090 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
             "Usage:\n" ++
-            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode fp8|nvfp4|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
-            "  squid5090 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
-            "  squid5090 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
-            "  squid5090 longctx  <model_dir> [--mode exact|fp8|nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
-            "  squid5090 logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode exact] [--kv bf16] [--ctx 8192]\n" ++
-            "  squid5090 kld      <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref FILE [--mode exact|fp8|nvfp4] [--kv auto|bf16|fp8|q4] [--ctx 8192]\n" ++
+            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode fp8|nvfp4|exact] [--kv auto|bf16|fp8|q4] [--share-loop-kv] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
+            "  squid5090 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode exact] [--kv auto] [--share-loop-kv] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
+            "  squid5090 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode exact] [--kv auto] [--share-loop-kv] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
+            "  squid5090 longctx  <model_dir> [--mode exact|fp8|nvfp4] [--kv fp8|q4|bf16] [--share-loop-kv] [--ctx 1048576]\n" ++
+            "  squid5090 logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode exact] [--kv bf16] [--share-loop-kv] [--ctx 8192]\n" ++
+            "  squid5090 kld      <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref FILE [--mode exact|fp8|nvfp4] [--kv auto|bf16|fp8|q4] [--share-loop-kv] [--ctx 8192]\n" ++
             "  squid5090 tokenize <model_dir> (--prompt TEXT | --prompt-file PATH) [--raw]\n",
     );
 }

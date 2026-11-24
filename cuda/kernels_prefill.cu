@@ -961,6 +961,11 @@ p_flash_attn_prefill_tc_kernel(
     const void* __restrict__ v_cache,
     const __half* __restrict__ k_scale,
     const __half* __restrict__ v_scale,
+    const void* __restrict__ k_bulk,
+    const void* __restrict__ v_bulk,
+    const __half* __restrict__ ks_bulk,
+    const __half* __restrict__ vs_bulk,
+    int bulk_cap,
     __half* __restrict__ out_gated_h,
     int kv_cap,
     int window,
@@ -1086,11 +1091,17 @@ p_flash_attn_prefill_tc_kernel(
             int t_loc = idx >> 4;
             int sub = idx & 15;
             if (t_loc < tile_len) {
-                int slot = (t0 + t_loc) % kv_cap;
+                int t_abs = t0 + t_loc;
+                bool use_bulk = (k_bulk != nullptr && t_abs < pos0);
+                int slot = use_bulk ? (t_abs % bulk_cap) : (t_abs % kv_cap);
+                const void* kc = use_bulk ? k_bulk : k_cache;
+                const void* vc = use_bulk ? v_bulk : v_cache;
+                const __half* ks = use_bulk ? ks_bulk : k_scale;
+                const __half* vs = use_bulk ? vs_bulk : v_scale;
                 *reinterpret_cast<uint4*>(&s_k[t_loc][sub * 8]) =
-                    load_kv_8elems_h2x4<KV_FMT>(k_cache, k_scale, slot, kvh, sub);
+                    load_kv_8elems_h2x4<KV_FMT>(kc, ks, slot, kvh, sub);
                 *reinterpret_cast<uint4*>(&s_v[t_loc][sub * 8]) =
-                    load_kv_8elems_h2x4<KV_FMT>(v_cache, v_scale, slot, kvh, sub);
+                    load_kv_8elems_h2x4<KV_FMT>(vc, vs, slot, kvh, sub);
             } else {
                 *reinterpret_cast<uint4*>(&s_k[t_loc][sub * 8]) = make_uint4(0, 0, 0, 0);
                 *reinterpret_cast<uint4*>(&s_v[t_loc][sub * 8]) = make_uint4(0, 0, 0, 0);
@@ -1397,25 +1408,27 @@ void launch_prefill_flash_attn_tc(
     const float* qrgs, const __nv_bfloat16* rel_proj,
     const void* k_cache, const void* v_cache,
     const __half* k_scale, const __half* v_scale,
+    const void* k_bulk_cache, const void* v_bulk_cache,
+    const __half* k_bulk_scale, const __half* v_bulk_scale, int bulk_kv_cap,
     KVFormat kv_fmt, __half* out_gated_h,
     int kv_cap, int window, int B, const int32_t* d_pos, cudaStream_t stream) {
     if (window > 0) {
         // Local SWA (BF16): Q_TOK=16 (48 queries/CTA, 3 warps=96 threads -> 128 CTAs for B=256 = 1 wave!)
         dim3 grid(NUM_KV_HEADS, (B + 15) / 16);
         p_flash_attn_prefill_tc_kernel<0, 16><<<grid, 96, 0, stream>>>(
-            qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, window, B, d_pos);
+            qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, nullptr, nullptr, nullptr, nullptr, 0, out_gated_h, kv_cap, window, B, d_pos);
     } else {
         // Global (BF16/FP8/Q4): Q_TOK=32 (96 queries/CTA, 6 warps=192 threads -> 128 CTAs for B=512 = 1 wave!)
         dim3 grid(NUM_KV_HEADS, (B + 31) / 32);
         if (kv_fmt == KVFormat::FP8) {
             p_flash_attn_prefill_tc_kernel<1, 32><<<grid, 192, 0, stream>>>(
-                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, 0, B, d_pos);
+                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, out_gated_h, kv_cap, 0, B, d_pos);
         } else if (kv_fmt == KVFormat::Q4) {
             p_flash_attn_prefill_tc_kernel<2, 32><<<grid, 192, 0, stream>>>(
-                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, 0, B, d_pos);
+                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, out_gated_h, kv_cap, 0, B, d_pos);
         } else {
             p_flash_attn_prefill_tc_kernel<0, 32><<<grid, 192, 0, stream>>>(
-                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, 0, B, d_pos);
+                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, out_gated_h, kv_cap, 0, B, d_pos);
         }
     }
 }
