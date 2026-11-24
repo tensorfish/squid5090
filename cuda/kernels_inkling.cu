@@ -567,15 +567,18 @@ __global__ void dynamic_sconv_kernel(
     }
 }
 
-// Fused Q/R/K/V prep + KV cache store
+// Fused Q/R/K/V prep + KV cache store (BF16/FP8/Q4)
+template <int KV_FMT>
 __global__ void attn_prep_store_kernel(
     float* __restrict__ qrgs,
     const float* __restrict__ ck,
     const float* __restrict__ cv,
     const __nv_bfloat16* __restrict__ q_clip_scale,
     const __nv_bfloat16* __restrict__ rel_clip_scale,
-    __nv_bfloat16* __restrict__ k_cache,
-    __nv_bfloat16* __restrict__ v_cache,
+    void* __restrict__ k_cache,
+    void* __restrict__ v_cache,
+    __half* __restrict__ k_scale,
+    __half* __restrict__ v_scale,
     int kv_cap,
     bool is_global,
     const int32_t* __restrict__ d_pos) {
@@ -625,7 +628,7 @@ __global__ void attn_prep_store_kernel(
         if (tid == 0) factor = fminf(QK_CLIP / (sqrtf(sm[0] + sm[1] + sm[2] + sm[3]) + 1e-6f), 1.0f);
         __syncthreads();
         int slot = pos % kv_cap;
-        k_cache[(size_t)slot * KV_DIM + h * HEAD_DIM + tid] = __float2bfloat16(val * factor);
+        store_kv_head_128<KV_FMT>(val * factor, slot, h, tid, k_cache, k_scale, sm);
     } else {
         int h = kind_id - 56;
         const float* vp = cv + (size_t)b * KV_DIM + h * HEAD_DIM;
@@ -638,7 +641,7 @@ __global__ void attn_prep_store_kernel(
         if (tid == 0) inv_rms = rsqrtf((sm[0] + sm[1] + sm[2] + sm[3]) / float(HEAD_DIM) + RMS_EPS);
         __syncthreads();
         int slot = pos % kv_cap;
-        v_cache[(size_t)slot * KV_DIM + h * HEAD_DIM + tid] = __float2bfloat16(val * inv_rms);
+        store_kv_head_128<KV_FMT>(val * inv_rms, slot, h, tid, v_cache, v_scale, sm);
     }
 }
 
@@ -1824,6 +1827,7 @@ mega_global_sconv_prep_store_kernel(
 // MEGA-FUSION 2 (v2): PARALLEL across B tokens! Grid = dim3(64, B), Block = 128!
 // Safe on 16-slot ring because b=0..B-1 ONLY reads prior slots pos0-3..pos0-1 from ring and reads
 // intra-batch history from read-only k_proj/v_proj, while writing distinct slots (pos0+b)&15!
+template <int KV_FMT>
 __global__ void __launch_bounds__(128)
 mega_local_sconv_prep_store_kernel(
     float* __restrict__ qrgs,
@@ -1835,8 +1839,10 @@ mega_local_sconv_prep_store_kernel(
     float* __restrict__ v_ring,
     const __nv_bfloat16* __restrict__ q_clip_scale,
     const __nv_bfloat16* __restrict__ rel_clip_scale,
-    __nv_bfloat16* __restrict__ k_cache,
-    __nv_bfloat16* __restrict__ v_cache,
+    void* __restrict__ k_cache,
+    void* __restrict__ v_cache,
+    __half* __restrict__ k_scale,
+    __half* __restrict__ v_scale,
     int kv_cap, const int32_t* __restrict__ d_pos) {
     int kind_id = blockIdx.x;
     int b = blockIdx.y;
@@ -1885,7 +1891,7 @@ mega_local_sconv_prep_store_kernel(
         __syncthreads();
         if (tid == 0) factor = fminf(QK_CLIP / (sqrtf(sm[0] + sm[1] + sm[2] + sm[3]) + 1e-6f), 1.0f);
         __syncthreads();
-        k_cache[(size_t)(p % kv_cap) * KV_DIM + c] = __float2bfloat16(val * factor);
+        store_kv_head_128<KV_FMT>(val * factor, p % kv_cap, h, tid, k_cache, k_scale, sm);
     } else {
         int h = kind_id - 56;
         int c = h * HEAD_DIM + tid;
@@ -1903,7 +1909,7 @@ mega_local_sconv_prep_store_kernel(
         __syncthreads();
         if (tid == 0) factor = rsqrtf((sm[0] + sm[1] + sm[2] + sm[3]) / float(HEAD_DIM) + RMS_EPS);
         __syncthreads();
-        v_cache[(size_t)(p % kv_cap) * KV_DIM + c] = __float2bfloat16(val * factor);
+        store_kv_head_128<KV_FMT>(val * factor, p % kv_cap, h, tid, v_cache, v_scale, sm);
     }
 }
 
@@ -2555,10 +2561,18 @@ void launch_dynamic_sconv(
 void launch_attn_prep_store(
     float* qrgs, const float* ck, const float* cv,
     const __nv_bfloat16* q_clip_scale, const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int kv_cap, bool is_global,
-    int B, const int32_t* d_pos, cudaStream_t stream) {
-    attn_prep_store_kernel<<<dim3(B, 64), 128, 0, stream>>>(
-        qrgs, ck, cv, q_clip_scale, rel_clip_scale, k_cache, v_cache, kv_cap, is_global, d_pos);
+    void* k_cache, void* v_cache, __half* k_scale, __half* v_scale, KVFormat kv_fmt,
+    int kv_cap, bool is_global, int B, const int32_t* d_pos, cudaStream_t stream) {
+    if (kv_fmt == KVFormat::FP8) {
+        attn_prep_store_kernel<1><<<dim3(B, 64), 128, 0, stream>>>(
+            qrgs, ck, cv, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, is_global, d_pos);
+    } else if (kv_fmt == KVFormat::Q4) {
+        attn_prep_store_kernel<2><<<dim3(B, 64), 128, 0, stream>>>(
+            qrgs, ck, cv, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, is_global, d_pos);
+    } else {
+        attn_prep_store_kernel<0><<<dim3(B, 64), 128, 0, stream>>>(
+            qrgs, ck, cv, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, is_global, d_pos);
+    }
 }
 
 template <int KV_FMT, int B_CONST>
@@ -2802,10 +2816,21 @@ void launch_mega_local_sconv_prep_store(
     const __nv_bfloat16* k_sconv_w, const __nv_bfloat16* v_sconv_w,
     float* k_ring, float* v_ring,
     const __nv_bfloat16* q_clip_scale, const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int kv_cap, int B, const int32_t* d_pos, cudaStream_t stream) {
-    launch_pdl(mega_local_sconv_prep_store_kernel, dim3(64, B), 128, stream,
-        qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_ring, v_ring,
-        q_clip_scale, rel_clip_scale, k_cache, v_cache, kv_cap, d_pos);
+    void* k_cache, void* v_cache, __half* k_scale, __half* v_scale, KVFormat kv_fmt,
+    int kv_cap, int B, const int32_t* d_pos, cudaStream_t stream) {
+    if (kv_fmt == KVFormat::FP8) {
+        launch_pdl(mega_local_sconv_prep_store_kernel<1>, dim3(64, B), 128, stream,
+            qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_ring, v_ring,
+            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+    } else if (kv_fmt == KVFormat::Q4) {
+        launch_pdl(mega_local_sconv_prep_store_kernel<2>, dim3(64, B), 128, stream,
+            qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_ring, v_ring,
+            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+    } else {
+        launch_pdl(mega_local_sconv_prep_store_kernel<0>, dim3(64, B), 128, stream,
+            qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_ring, v_ring,
+            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+    }
 }
 
 void launch_mega_attn_post_mlp_in(

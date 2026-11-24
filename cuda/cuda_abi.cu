@@ -625,12 +625,13 @@ void squid_launch_mega_global_sconv_prep_store(
 void squid_launch_mega_local_sconv_prep_store(
     float* qrgs, const float* k_proj, const float* v_proj, const void* k_sw, const void* v_sw,
     float* k_ring, float* v_ring, const void* q_cs, const void* r_cs,
-    void* k_cache, void* v_cache, int32_t kv_cap, int32_t B, const int32_t* d_pos, void* stream) {
+    void* k_cache, void* v_cache, void* k_scale, void* v_scale, uint8_t kv_fmt,
+    int32_t kv_cap, int32_t B, const int32_t* d_pos, void* stream) {
     launch_mega_local_sconv_prep_store(
         qrgs, k_proj, v_proj, static_cast<const __nv_bfloat16*>(k_sw), static_cast<const __nv_bfloat16*>(v_sw),
         k_ring, v_ring, static_cast<const __nv_bfloat16*>(q_cs), static_cast<const __nv_bfloat16*>(r_cs),
-        static_cast<__nv_bfloat16*>(k_cache), static_cast<__nv_bfloat16*>(v_cache),
-        kv_cap, B, d_pos, static_cast<cudaStream_t>(stream));
+        k_cache, v_cache, static_cast<__half*>(k_scale), static_cast<__half*>(v_scale),
+        static_cast<KVFormat>(kv_fmt), kv_cap, B, d_pos, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_relative_attention_gated(
@@ -916,15 +917,15 @@ void squid_launch_prefill_local_sconv_prep_store(
     const void* k_sw, const void* v_sw,
     float* k_ring, float* v_ring,
     const void* q_cs, const void* r_cs,
-    void* k_cache, void* v_cache,
+    void* k_cache, void* v_cache, void* k_scale, void* v_scale, uint8_t kv_fmt,
     int32_t kv_cap, int32_t B, const int32_t* d_pos, void* stream) {
     launch_prefill_local_sconv_prep_store(
         qrgs, k_proj, v_proj,
         static_cast<const __nv_bfloat16*>(k_sw), static_cast<const __nv_bfloat16*>(v_sw),
         k_ring, v_ring,
         static_cast<const __nv_bfloat16*>(q_cs), static_cast<const __nv_bfloat16*>(r_cs),
-        static_cast<__nv_bfloat16*>(k_cache), static_cast<__nv_bfloat16*>(v_cache),
-        kv_cap, B, d_pos, static_cast<cudaStream_t>(stream));
+        k_cache, v_cache, static_cast<__half*>(k_scale), static_cast<__half*>(v_scale),
+        static_cast<KVFormat>(kv_fmt), kv_cap, B, d_pos, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_prefill_global_sconv_prep_store(

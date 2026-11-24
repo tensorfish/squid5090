@@ -220,8 +220,11 @@ void launch_attn_prep_store(
     const float* cv,            // [B, KV_DIM]
     const __nv_bfloat16* q_clip_scale,
     const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache,     // [cap, KV_DIM]
-    __nv_bfloat16* v_cache,     // [cap, KV_DIM]
+    void* k_cache,              // [cap, KV_DIM] (BF16/FP8) or [cap, KV_DIM/2] (Q4)
+    void* v_cache,              // [cap, KV_DIM] (BF16/FP8) or [cap, KV_DIM/2] (Q4)
+    __half* k_scale,            // optional: FP8 [cap, 8], Q4 [cap, 16]
+    __half* v_scale,            // optional: FP8 [cap, 8], Q4 [cap, 16]
+    KVFormat kv_fmt,
     int kv_cap,
     bool is_global,
     int B, const int32_t* d_pos,
@@ -370,8 +373,11 @@ void launch_mega_local_sconv_prep_store(
     float* v_ring,
     const __nv_bfloat16* q_clip_scale,
     const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache,
-    __nv_bfloat16* v_cache,
+    void* k_cache,
+    void* v_cache,
+    __half* k_scale,
+    __half* v_scale,
+    KVFormat kv_fmt,
     int kv_cap,
     int B, const int32_t* d_pos,
     cudaStream_t stream);
@@ -519,8 +525,11 @@ void launch_prefill_local_sconv_prep_store(
     float* v_ring,
     const __nv_bfloat16* q_clip_scale,
     const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache,
-    __nv_bfloat16* v_cache,
+    void* k_cache,
+    void* v_cache,
+    __half* k_scale,
+    __half* v_scale,
+    KVFormat kv_fmt,
     int kv_cap,
     int B,
     const int32_t* d_pos,

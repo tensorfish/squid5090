@@ -1347,13 +1347,13 @@ void launch_prefill_local_sconv_prep_store(
     const __nv_bfloat16* k_sconv_w, const __nv_bfloat16* v_sconv_w,
     float* k_ring, float* v_ring,
     const __nv_bfloat16* q_clip_scale, const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
+    void* k_cache, void* v_cache, __half* k_scale, __half* v_scale, KVFormat kv_fmt,
     int kv_cap, int B, const int32_t* d_pos, cudaStream_t stream) {
     launch_static_sconv(k_proj, k_sconv_w, k_ring, k_proj, B, KV_DIM, d_pos, stream);
     launch_static_sconv(v_proj, v_sconv_w, v_ring, v_proj, B, KV_DIM, d_pos, stream);
     launch_attn_prep_store(
         qrgs, k_proj, v_proj, q_clip_scale, rel_clip_scale,
-        k_cache, v_cache, kv_cap, false, B, d_pos, stream);
+        k_cache, v_cache, k_scale, v_scale, kv_fmt, kv_cap, false, B, d_pos, stream);
 }
 
 void launch_prefill_global_sconv_prep_store(
@@ -1400,10 +1400,18 @@ void launch_prefill_flash_attn_tc(
     KVFormat kv_fmt, __half* out_gated_h,
     int kv_cap, int window, int B, const int32_t* d_pos, cudaStream_t stream) {
     if (window > 0) {
-        // Local SWA (BF16): Q_TOK=16 (48 queries/CTA, 3 warps=96 threads -> 128 CTAs for B=256 = 1 wave!)
+        // Local SWA (BF16/FP8/Q4): Q_TOK=16 (48 queries/CTA, 3 warps=96 threads -> 128 CTAs for B=256 = 1 wave!)
         dim3 grid(NUM_KV_HEADS, (B + 15) / 16);
-        p_flash_attn_prefill_tc_kernel<0, 16><<<grid, 96, 0, stream>>>(
-            qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, window, B, d_pos);
+        if (kv_fmt == KVFormat::FP8) {
+            p_flash_attn_prefill_tc_kernel<1, 16><<<grid, 96, 0, stream>>>(
+                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, window, B, d_pos);
+        } else if (kv_fmt == KVFormat::Q4) {
+            p_flash_attn_prefill_tc_kernel<2, 16><<<grid, 96, 0, stream>>>(
+                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, window, B, d_pos);
+        } else {
+            p_flash_attn_prefill_tc_kernel<0, 16><<<grid, 96, 0, stream>>>(
+                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, window, B, d_pos);
+        }
     } else {
         // Global (BF16/FP8/Q4): Q_TOK=32 (96 queries/CTA, 6 warps=192 threads -> 128 CTAs for B=512 = 1 wave!)
         dim3 grid(NUM_KV_HEADS, (B + 31) / 32);

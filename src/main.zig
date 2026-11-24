@@ -28,6 +28,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var prompt_file: []const u8 = "";
     var mode_str: []const u8 = if (std.mem.eql(u8, command, "serve")) "fp8" else "exact";
     var kv_str: []const u8 = "auto";
+    var local_kv_str: []const u8 = "bf16";
+    if (tiger.getenv("SQUID_LOCAL_KV_FP8")) |lkv| {
+        if (std.mem.eql(u8, std.mem.span(lkv), "1")) local_kv_str = "fp8";
+    }
     var host: []const u8 = "0.0.0.0";
     var model_name: []const u8 = "inkling-2-mini";
     var model_name_explicit: bool = false;
@@ -79,6 +83,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--kv") and arg_i + 1 < argv.len) {
             arg_i += 1;
             kv_str = std.mem.span(argv[arg_i]);
+        } else if (std.mem.eql(u8, arg, "--local-kv") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            local_kv_str = std.mem.span(argv[arg_i]);
         } else if (std.mem.eql(u8, arg, "--host") and arg_i + 1 < argv.len) {
             arg_i += 1;
             host = std.mem.span(argv[arg_i]);
@@ -148,6 +155,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             keep_history_thinking = true;
         }
     }
+
+    const local_kv_format: constants.KVFormat = if (std.mem.eql(u8, local_kv_str, "bf16"))
+        .bf16
+    else if (std.mem.eql(u8, local_kv_str, "fp8"))
+        .fp8
+    else {
+        tiger.print_stderr("Unknown --local-kv '{s}' (expected bf16|fp8)\n", .{local_kv_str});
+        return 1;
+    };
 
     const prompt_file_buf: ?[]u8 = if (prompt_file.len > 0) tiger.alloc_host_zeroed(u8, 32 * 1024 * 1024) else null;
     defer if (prompt_file_buf) |b| tiger.free_host_slice(u8, b);
@@ -265,7 +281,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     defer model_weights.deinit();
 
     var engine: engine_mod.Engine = .{};
-    engine.init(&model_weights, ctx, use_graphs, kv_format);
+    engine.init(&model_weights, ctx, use_graphs, kv_format, local_kv_format);
     engine.spec_threshold = spec_threshold;
     engine.use_prompt_lookup = use_prompt_lookup;
     engine.sample_params = .{
@@ -668,12 +684,12 @@ fn print_usage() void {
     tiger.write_fd_all(2,
         "squid5090 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
             "Usage:\n" ++
-            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode fp8|nvfp4|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
-            "  squid5090 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
-            "  squid5090 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
-            "  squid5090 longctx  <model_dir> [--mode exact|fp8|nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
-            "  squid5090 logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode exact] [--kv bf16] [--ctx 8192]\n" ++
-            "  squid5090 kld      <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref FILE [--mode exact|fp8|nvfp4] [--kv auto|bf16|fp8|q4] [--ctx 8192]\n" ++
+            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode fp8|nvfp4|exact] [--kv auto|bf16|fp8|q4] [--local-kv bf16|fp8] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
+            "  squid5090 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode exact] [--kv auto] [--local-kv bf16|fp8] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
+            "  squid5090 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode exact] [--kv auto] [--local-kv bf16|fp8] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
+            "  squid5090 longctx  <model_dir> [--mode exact|fp8|nvfp4] [--kv fp8|q4|bf16] [--local-kv bf16|fp8] [--ctx 1048576]\n" ++
+            "  squid5090 logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode exact] [--kv bf16] [--local-kv bf16|fp8] [--ctx 8192]\n" ++
+            "  squid5090 kld      <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref FILE [--mode exact|fp8|nvfp4] [--kv auto|bf16|fp8|q4] [--local-kv bf16|fp8] [--ctx 8192]\n" ++
             "  squid5090 tokenize <model_dir> (--prompt TEXT | --prompt-file PATH) [--raw]\n",
     );
 }

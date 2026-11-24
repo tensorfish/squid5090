@@ -148,6 +148,7 @@ pub const Engine = struct {
     context_tokens_max: u32 = 0,
     use_graphs: bool = true,
     kv_format: constants.KVFormat = .fp8,
+    local_kv_format: constants.KVFormat = .bf16,
     current_position: i32 = 0,
     schedule: [constants.visit_count]constants.VisitInfo = undefined,
 
@@ -296,6 +297,7 @@ pub const Engine = struct {
         context_tokens_max: u32,
         use_graphs: bool,
         kv_format: constants.KVFormat,
+        local_kv_format: constants.KVFormat,
     ) void {
         tiger.assert(context_tokens_max >= 64);
         tiger.assert(self.arena.base_ptr == null);
@@ -304,6 +306,7 @@ pub const Engine = struct {
         self.context_tokens_max = context_tokens_max;
         self.use_graphs = use_graphs;
         self.kv_format = kv_format;
+        self.local_kv_format = local_kv_format;
         self.schedule = constants.build_visit_schedule();
 
         tiger.assert_cuda(cuda.squid_cuda_stream_create(&self.stream));
@@ -321,6 +324,7 @@ pub const Engine = struct {
             &self.schedule,
             context_tokens_max,
             kv_format,
+            local_kv_format,
             has_dspark,
             expert_groups_bytes,
         );
@@ -331,7 +335,7 @@ pub const Engine = struct {
         while (vi < constants.visit_count) : (vi += 1) {
             const is_glob: bool = self.schedule[vi].is_global;
             const cap: u32 = if (is_glob) context_tokens_max else (constants.swa_window_tokens + prefill_local_attn_sub);
-            const vfmt: constants.KVFormat = if (is_glob) kv_format else .bf16;
+            const vfmt: constants.KVFormat = if (is_glob) kv_format else local_kv_format;
             self.kv_cap[vi] = @intCast(cap);
             self.alloc_kv_pair(cap, vfmt, &self.k_cache[vi], &self.v_cache[vi], &self.k_scale[vi], &self.v_scale[vi]);
             self.k_ring[vi] = self.arena.alloc_many(f32, constants.sconv_ring_slots * constants.kv_dim);
@@ -485,8 +489,8 @@ pub const Engine = struct {
 
         const rt_gib: f64 = @as(f64, @floatFromInt(self.arena.capacity_bytes)) / (1024.0 * 1024.0 * 1024.0);
         tiger.print_stdout(
-            "[engine] Initialized max_ctx={d} | kv={s} | runtime VRAM={d:.2} GiB (1 arena, {d} slices) | graphs={s}\n",
-            .{ context_tokens_max, kv_format.name(), rt_gib, self.arena.allocation_count, if (use_graphs) "on" else "off" },
+            "[engine] Initialized max_ctx={d} | kv={s} local_kv={s} | runtime VRAM={d:.2} GiB (1 arena, {d} slices) | graphs={s}\n",
+            .{ context_tokens_max, kv_format.name(), local_kv_format.name(), rt_gib, self.arena.allocation_count, if (use_graphs) "on" else "off" },
         );
         self.reset();
     }
@@ -579,7 +583,8 @@ pub const Engine = struct {
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
             if (!self.schedule[vi].is_global) {
-                total += 2 * @as(usize, @intCast(self.kv_cap[vi])) * constants.kv_dim * 2;
+                const sz = global_kv_bytes_for_tokens(self.local_kv_format, @intCast(self.kv_cap[vi]));
+                total += 2 * sz.data + 2 * sz.scale;
             }
             total += 2 * constants.sconv_ring_slots * constants.kv_dim * 4;
             total += 2 * constants.sconv_ring_slots * constants.hidden_dim * 4;
@@ -629,11 +634,17 @@ pub const Engine = struct {
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
             if (!self.schedule[vi].is_global) {
-                const kv_bytes: usize = @as(usize, @intCast(self.kv_cap[vi])) * constants.kv_dim * 2;
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.k_cache[vi].?, kv_bytes, self.stream));
-                off += kv_bytes;
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.v_cache[vi].?, kv_bytes, self.stream));
-                off += kv_bytes;
+                const sz = global_kv_bytes_for_tokens(self.local_kv_format, @intCast(self.kv_cap[vi]));
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.k_cache[vi].?, sz.data, self.stream));
+                off += sz.data;
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.v_cache[vi].?, sz.data, self.stream));
+                off += sz.data;
+                if (sz.scale > 0) {
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.k_scale[vi].?, sz.scale, self.stream));
+                    off += sz.scale;
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.v_scale[vi].?, sz.scale, self.stream));
+                    off += sz.scale;
+                }
             }
             const kv_ring_bytes: usize = constants.sconv_ring_slots * constants.kv_dim * 4;
             const h_ring_bytes: usize = constants.sconv_ring_slots * constants.hidden_dim * 4;
@@ -677,11 +688,17 @@ pub const Engine = struct {
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
             if (!self.schedule[vi].is_global) {
-                const kv_bytes: usize = @as(usize, @intCast(self.kv_cap[vi])) * constants.kv_dim * 2;
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.k_cache[vi].?, @ptrCast(src[off..].ptr), kv_bytes, self.stream));
-                off += kv_bytes;
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.v_cache[vi].?, @ptrCast(src[off..].ptr), kv_bytes, self.stream));
-                off += kv_bytes;
+                const sz = global_kv_bytes_for_tokens(self.local_kv_format, @intCast(self.kv_cap[vi]));
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.k_cache[vi].?, @ptrCast(src[off..].ptr), sz.data, self.stream));
+                off += sz.data;
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.v_cache[vi].?, @ptrCast(src[off..].ptr), sz.data, self.stream));
+                off += sz.data;
+                if (sz.scale > 0) {
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.k_scale[vi].?, @ptrCast(src[off..].ptr), sz.scale, self.stream));
+                    off += sz.scale;
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.v_scale[vi].?, @ptrCast(src[off..].ptr), sz.scale, self.stream));
+                    off += sz.scale;
+                }
             }
             const kv_ring_bytes: usize = constants.sconv_ring_slots * constants.kv_dim * 4;
             const h_ring_bytes: usize = constants.sconv_ring_slots * constants.hidden_dim * 4;
@@ -1567,6 +1584,9 @@ pub const Engine = struct {
                         lw.rel_clip_scale.?,
                         self.k_cache[vi].?,
                         self.v_cache[vi].?,
+                        self.k_scale[vi],
+                        self.v_scale[vi],
+                        @intFromEnum(self.local_kv_format),
                         self.kv_cap[vi],
                         @intCast(sub_b),
                         d_pos_sub,
@@ -1578,9 +1598,9 @@ pub const Engine = struct {
                         lw.rel_logits_proj.?,
                         self.k_cache[vi].?,
                         self.v_cache[vi].?,
-                        null,
-                        null,
-                        @intFromEnum(constants.KVFormat.bf16),
+                        self.k_scale[vi],
+                        self.v_scale[vi],
+                        @intFromEnum(self.local_kv_format),
                         offset_f16_ptr(self.p_attn_gated_h, off * constants.query_dim),
                         self.kv_cap[vi],
                         constants.swa_window_tokens,
@@ -1855,12 +1875,12 @@ pub const Engine = struct {
 
         self.reset();
 
-        // Zero-init global KV caches so synthetic reads are strictly finite (zero NaN)
+        // Zero-init KV caches (global & local) so synthetic reads are strictly finite (zero NaN)
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
-            if (!self.schedule[vi].is_global) continue;
+            const vfmt = if (self.schedule[vi].is_global) self.kv_format else self.local_kv_format;
             const cap: u64 = @intCast(self.kv_cap[vi]);
-            const data_bytes: usize = @intCast(switch (self.kv_format) {
+            const data_bytes: usize = @intCast(switch (vfmt) {
                 .bf16 => cap * constants.kv_dim * 2,
                 .fp8 => cap * constants.kv_dim,
                 .q4 => cap * (constants.kv_dim / 2),
@@ -1868,7 +1888,7 @@ pub const Engine = struct {
             tiger.assert_cuda(cuda.squid_cuda_memset_async(self.k_cache[vi].?, 0, data_bytes, self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memset_async(self.v_cache[vi].?, 0, data_bytes, self.stream));
             if (self.k_scale[vi]) |ks| {
-                const scale_bytes: usize = @intCast(if (self.kv_format == .fp8)
+                const scale_bytes: usize = @intCast(if (vfmt == .fp8)
                     cap * constants.kv_head_count * 2
                 else
                     cap * constants.kv_q4_scales_per_token * 2);
@@ -2292,6 +2312,9 @@ pub const Engine = struct {
                     lw.rel_clip_scale.?,
                     self.k_cache[vi].?,
                     self.v_cache[vi].?,
+                    self.k_scale[vi],
+                    self.v_scale[vi],
+                    @intFromEnum(self.local_kv_format),
                     self.kv_cap[vi],
                     batch_size,
                     self.d_pos,
@@ -2306,7 +2329,7 @@ pub const Engine = struct {
                 self.v_cache[vi].?,
                 self.k_scale[vi],
                 self.v_scale[vi],
-                if (v.is_global) @intFromEnum(self.kv_format) else @intFromEnum(constants.KVFormat.bf16),
+                if (v.is_global) @intFromEnum(self.kv_format) else @intFromEnum(self.local_kv_format),
                 self.split_buf,
                 if (use_half_dense) null else self.attn_gated,
                 if (use_half_dense) self.attn_gated_h else null,
@@ -2653,6 +2676,7 @@ fn compute_runtime_vram_bytes(
     schedule: *const [constants.visit_count]constants.VisitInfo,
     context_tokens_max: u32,
     kv_format: constants.KVFormat,
+    local_kv_format: constants.KVFormat,
     has_dspark: bool,
     expert_groups_bytes: u64,
 ) u64 {
@@ -2663,7 +2687,7 @@ fn compute_runtime_vram_bytes(
     while (vi < constants.visit_count) : (vi += 1) {
         const is_glob = schedule[vi].is_global;
         const cap: u32 = if (is_glob) context_tokens_max else (constants.swa_window_tokens + prefill_local_attn_sub);
-        const vfmt: constants.KVFormat = if (is_glob) kv_format else .bf16;
+        const vfmt: constants.KVFormat = if (is_glob) kv_format else local_kv_format;
         total += constants.kv_cache_pair_vram_bytes(cap, vfmt);
         total += 2 * tiger.align_up_u64(constants.sconv_ring_slots * constants.kv_dim * 4, a);
         total += 2 * tiger.align_up_u64(constants.sconv_ring_slots * constants.hidden_dim * 4, a);
