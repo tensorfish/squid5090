@@ -21,11 +21,18 @@ pub fn build(b: *std.Build) void {
         "CUDA Blackwell SM architecture (default: 120a)",
     ) orelse "120a";
 
+    const default_cuda_path: []const u8 = if (@import("builtin").os.tag == .linux and
+        std.os.linux.access("/usr/local/cuda/bin/nvcc", 0) != 0 and
+        std.os.linux.access("/opt/cuda/bin/nvcc", 0) == 0)
+        "/opt/cuda"
+    else
+        "/usr/local/cuda";
+
     const cuda_path = b.option(
         []const u8,
         "cuda-path",
-        "CUDA toolkit root directory (default: /usr/local/cuda)",
-    ) orelse "/usr/local/cuda";
+        "CUDA toolkit root directory (auto-detects /usr/local/cuda or /opt/cuda)",
+    ) orelse default_cuda_path;
 
     const nvcc_bin = b.fmt("{s}/bin/nvcc", .{cuda_path});
     const cuda_lib = b.fmt("{s}/lib64", .{cuda_path});
@@ -78,6 +85,7 @@ pub fn build(b: *std.Build) void {
     }
 
     root_module.addLibraryPath(.{ .cwd_relative = cuda_lib });
+    root_module.addRPath(.{ .cwd_relative = cuda_lib });
     root_module.linkSystemLibrary("cudart", .{});
     root_module.linkSystemLibrary("cublas", .{});
     root_module.linkSystemLibrary("stdc++", .{});

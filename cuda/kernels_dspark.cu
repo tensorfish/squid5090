@@ -448,7 +448,17 @@ markov_rnn_proj_kernel(
 }
 
 // Persistent 680-block SMEM NVFP4 base_logits[K, Vd] = unembed_draft @ normed_h + fold_b (HALF-WARP -> 0% idle!)
-constexpr int DSPARK_UNEMBED_BLOCKS = 680;
+static int get_dspark_sm_count() {
+    static int cached = 0;
+    if (cached > 0) return cached;
+    int dev = 0, sms = 170;
+    if (cudaGetDevice(&dev) == cudaSuccess) {
+        int attr = 0;
+        if (cudaDeviceGetAttribute(&attr, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && attr > 0) sms = attr;
+    }
+    cached = sms;
+    return cached;
+}
 
 template <int K_CONST>
 __global__ void __launch_bounds__(256)
@@ -638,7 +648,7 @@ dspark_base_logits_nvfp4_mma_kernel(
     }
 }
 
-constexpr int MARKOV_BLOCKS = 340; // 2 blocks/SM (16 rows/block = 5440 concurrent rows -> 0% tail!)
+constexpr int MARKOV_BLOCKS_MAX = 512;
 
 template <int KIND> // 0=BF16, 2=NVFP4
 __global__ void __launch_bounds__(256)
@@ -761,13 +771,14 @@ __global__ void markov_fold_argmax_stage2_kernel(
     const SampleConfig* __restrict__ sample_cfg,
     const int32_t* __restrict__ d_pos,
     int step_idx,
-    int V) {
+    int V,
+    int n_blocks) {
     int tid = threadIdx.x;
     float bv = -1e30f;
     int32_t bi = 0;
     float cm = -1e30f;
     float csum = 0.0f;
-    for (int i = tid; i < MARKOV_BLOCKS; i += 256) {
+    for (int i = tid; i < n_blocks; i += 256) {
         float v = blk_val[i];
         int32_t idx = blk_idx[i];
         if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; }
@@ -1046,11 +1057,15 @@ void launch_dspark_draft(
     float* c_h         = c_f + 3 * MTP_MARKOV_RANK;
     float* state       = c_h + MTP_MAX_DRAFTS * (3 * MTP_MARKOV_RANK);
     float* raw_rnn     = state + MTP_MARKOV_RANK;
+    const int sms = get_dspark_sm_count();
+    const int unembed_blocks = min(1024, max(64, (sms <= 64) ? (sms * 8) : (sms * 4)));
+    const int markov_blocks = min(MARKOV_BLOCKS_MAX, max(64, (sms <= 64) ? (sms * 4) : (sms * 2)));
+
     float* blk_val     = raw_rnn + 3 * MTP_MARKOV_RANK;
-    int32_t* blk_idx   = reinterpret_cast<int32_t*>(blk_val + MARKOV_BLOCKS);
-    float* blk_cm      = reinterpret_cast<float*>(blk_idx + MARKOV_BLOCKS);
-    float* blk_csum    = blk_cm + MARKOV_BLOCKS;
-    float* base_logits = blk_csum + MARKOV_BLOCKS;
+    int32_t* blk_idx   = reinterpret_cast<int32_t*>(blk_val + markov_blocks);
+    float* blk_cm      = reinterpret_cast<float*>(blk_idx + markov_blocks);
+    float* blk_csum    = blk_cm + markov_blocks;
+    float* base_logits = blk_csum + markov_blocks;
 
     bool use_half = (dw.layers[0].w_qkv.kind != WeightKind::BF16);
 
@@ -1122,13 +1137,13 @@ void launch_dspark_draft(
         const auto* ws_sc = dw.unembed_draft.scales;
         float gs = dw.unembed_draft.global_scale;
         switch (num_drafts) {
-            case 1: dspark_base_logits_nvfp4_kernel<1><<<DSPARK_UNEMBED_BLOCKS, 256, 0, stream>>>(wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd); break;
-            case 2: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<2>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
-            case 3: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<3>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
-            case 4: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<4>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
-            case 5: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<5>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
-            case 6: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<6>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
-            case 7: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<7>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
+            case 1: dspark_base_logits_nvfp4_kernel<1><<<unembed_blocks, 256, 0, stream>>>(wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd); break;
+            case 2: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<2>, dim3(unembed_blocks), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
+            case 3: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<3>, dim3(unembed_blocks), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
+            case 4: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<4>, dim3(unembed_blocks), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
+            case 5: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<5>, dim3(unembed_blocks), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
+            case 6: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<6>, dim3(unembed_blocks), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
+            case 7: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<7>, dim3(unembed_blocks), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
         }
     } else if (dw.unembed_draft.kind != WeightKind::BF16) {
         launch_linear_h(dw.unembed_draft, normed_h, base_logits, num_drafts, false, stream);
@@ -1147,12 +1162,12 @@ void launch_dspark_draft(
         const float* bl_i = base_logits + (size_t)i * Vd;
         float* dp_i = out_draft_probs ? (out_draft_probs + (size_t)i * Vd) : nullptr;
         if (dw.fold_w.kind == WeightKind::NVFP4) {
-            markov_fold_argmax_stage1_kernel<2><<<MARKOV_BLOCKS, 256, 0, stream>>>(
+            markov_fold_argmax_stage1_kernel<2><<<markov_blocks, 256, 0, stream>>>(
                 dw.fold_w.data, dw.fold_w.scales, dw.fold_w.global_scale,
                 bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum,
                 dp_i, sample_cfg, Vd);
         } else {
-            markov_fold_argmax_stage1_kernel<0><<<MARKOV_BLOCKS, 256, 0, stream>>>(
+            markov_fold_argmax_stage1_kernel<0><<<markov_blocks, 256, 0, stream>>>(
                 dw.fold_w.data, nullptr, 1.0f,
                 bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum,
                 dp_i, sample_cfg, Vd);
@@ -1161,7 +1176,7 @@ void launch_dspark_draft(
             blk_val, blk_idx, blk_cm, blk_csum, dw.draft_vocab_ids,
             out_draft_tokens + i, out_draft_conf ? (out_draft_conf + i) : nullptr,
             dp_i, out_draft_q_sel ? (out_draft_q_sel + i) : nullptr, out_draft_is_delta,
-            sample_cfg, d_pos, i, Vd);
+            sample_cfg, d_pos, i, Vd, markov_blocks);
     }
 }
 

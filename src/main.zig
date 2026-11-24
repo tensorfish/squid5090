@@ -36,6 +36,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var ref_path: []const u8 = "";
     var effort: []const u8 = "none";
     var api_key: []const u8 = "";
+    var api_key_file: []const u8 = "";
     if (tiger.getenv("SQUID_API_KEY")) |env_key| api_key = std.mem.span(env_key);
 
     var port: u16 = 8000;
@@ -104,6 +105,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--api-key") and arg_i + 1 < argv.len) {
             arg_i += 1;
             api_key = std.mem.span(argv[arg_i]);
+        } else if (std.mem.eql(u8, arg, "--api-key-file") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            api_key_file = std.mem.span(argv[arg_i]);
         } else if (std.mem.eql(u8, arg, "--mtp") and arg_i + 1 < argv.len) {
             arg_i += 1;
             mtp = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 0;
@@ -146,6 +150,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             raw_thinking = true;
         } else if (std.mem.eql(u8, arg, "--keep-history-thinking")) {
             keep_history_thinking = true;
+        }
+    }
+
+    var api_key_buf: [512]u8 = @splat(0);
+    if (api_key_file.len > 0) {
+        const raw_key = read_file_into(api_key_file, &api_key_buf) orelse {
+            tiger.print_stderr("Failed to read --api-key-file '{s}'\n", .{api_key_file});
+            return 1;
+        };
+        if (raw_key.len == api_key_buf.len) {
+            tiger.print_stderr("--api-key-file '{s}' exceeds {d}-byte limit\n", .{ api_key_file, api_key_buf.len - 1 });
+            return 1;
+        }
+        api_key = std.mem.trim(u8, raw_key, " \t\r\n");
+        if (api_key.len == 0) {
+            tiger.print_stderr("--api-key-file '{s}' is empty (refusing to start with auth disabled)\n", .{api_key_file});
+            return 1;
         }
     }
 
@@ -633,8 +654,11 @@ fn read_file_into(path: []const u8, buf: []u8) ?[]const u8 {
     var iter: u32 = 0;
     while (total < buf.len and iter < 65536) : (iter += 1) {
         const n = tiger.read(fd, buf[total..].ptr, buf.len - total);
-        if (n < 0 and tiger.get_errno() == tiger.EINTR) continue;
-        if (n <= 0) break;
+        if (n < 0) {
+            if (tiger.get_errno() == tiger.EINTR) continue;
+            return null;
+        }
+        if (n == 0) break;
         total += @intCast(n);
     }
     return buf[0..total];
@@ -668,7 +692,7 @@ fn print_usage() void {
     tiger.write_fd_all(2,
         "squid5090 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
             "Usage:\n" ++
-            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode fp8|nvfp4|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
+            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode fp8|nvfp4|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY | --api-key-file PATH]\n" ++
             "  squid5090 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
             "  squid5090 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
             "  squid5090 longctx  <model_dir> [--mode exact|fp8|nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++

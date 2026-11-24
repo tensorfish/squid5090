@@ -1262,7 +1262,23 @@ static void dispatch_linear_h_b(
 // Fused LM Head + Softcap(30) + GPU Argmax (HALF-WARP NVFP4 -> 0% tail waste!)
 // ============================================================================
 
-constexpr int LM_HEAD_BLOCKS = 680;
+constexpr int LM_HEAD_BLOCKS_MAX = 1024; // bounded by lm_blk_val / lm_blk_idx [B, 1024]
+
+static int get_lm_head_blocks() {
+    static int cached = 0;
+    if (cached > 0) return cached;
+    int dev = 0, sms = 170;
+    if (cudaGetDevice(&dev) == cudaSuccess) {
+        int attr = 0;
+        if (cudaDeviceGetAttribute(&attr, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && attr > 0) sms = attr;
+    }
+    // 4 blocks/SM on large GPUs (170 SMs -> 680 exact), 8 blocks/SM on smaller GPUs (26 SMs -> 208)
+    int blks = (sms <= 64) ? (sms * 8) : (sms * 4);
+    if (blks < 64) blks = 64;
+    if (blks > LM_HEAD_BLOCKS_MAX) blks = LM_HEAD_BLOCKS_MAX;
+    cached = blks;
+    return cached;
+}
 
 template <int B_CONST, int KIND>
 __global__ void __launch_bounds__(256)
@@ -1423,8 +1439,8 @@ lm_head_stage1_kernel(
         for (int w = 1; w < RPB; ++w) {
             if (sm_val[b][w] > bv || (sm_val[b][w] == bv && sm_idx[b][w] < bi)) { bv = sm_val[b][w]; bi = sm_idx[b][w]; }
         }
-        blk_max_val[b * LM_HEAD_BLOCKS + blockIdx.x] = bv;
-        blk_max_idx[b * LM_HEAD_BLOCKS + blockIdx.x] = bi;
+        blk_max_val[b * (int)gridDim.x + (int)blockIdx.x] = bv;
+        blk_max_idx[b * (int)gridDim.x + (int)blockIdx.x] = bi;
     }
 }
 
@@ -1566,8 +1582,8 @@ lm_head_nvfp4_mma_stage1_kernel(
                 if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
             }
             if (tid == 0) {
-                blk_max_val[b * LM_HEAD_BLOCKS + blockIdx.x] = bv;
-                blk_max_idx[b * LM_HEAD_BLOCKS + blockIdx.x] = bi;
+                blk_max_val[b * (int)gridDim.x + (int)blockIdx.x] = bv;
+                blk_max_idx[b * (int)gridDim.x + (int)blockIdx.x] = bi;
             }
         }
     }
@@ -1702,8 +1718,8 @@ lm_head_fp8_mma_stage1_kernel(
                 if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
             }
             if (tid == 0) {
-                blk_max_val[b * LM_HEAD_BLOCKS + blockIdx.x] = bv;
-                blk_max_idx[b * LM_HEAD_BLOCKS + blockIdx.x] = bi;
+                blk_max_val[b * (int)gridDim.x + (int)blockIdx.x] = bv;
+                blk_max_idx[b * (int)gridDim.x + (int)blockIdx.x] = bi;
             }
         }
     }
@@ -1723,16 +1739,17 @@ __global__ void lm_head_stage2_argmax_kernel(
     const int32_t* __restrict__ inv_draft_vocab,
     int draft_vocab_size,
     int V,
-    int B) {
+    int B,
+    int n_blocks) {
     pdl_wait_fenced(0u);
     int b = blockIdx.x;
     if (b >= B) return;
     int tid = threadIdx.x;
     float bv = -1e30f;
     int32_t bi = 0;
-    for (int i = tid; i < LM_HEAD_BLOCKS; i += 256) {
-        float v = ld_dep_f32(blk_max_val + b * LM_HEAD_BLOCKS + i);
-        int32_t idx = blk_max_idx[b * LM_HEAD_BLOCKS + i];
+    for (int i = tid; i < n_blocks; i += 256) {
+        float v = ld_dep_f32(blk_max_val + b * n_blocks + i);
+        int32_t idx = blk_max_idx[b * n_blocks + i];
         if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; }
     }
     #pragma unroll
@@ -2369,34 +2386,35 @@ static void dispatch_lm_head(
     const int32_t* d_draft_tokens, const float* d_draft_probs, const float* d_draft_q_sel,
     const int32_t* d_draft_is_delta, const int32_t* inv_draft_vocab, int draft_vocab_size,
     cudaStream_t stream) {
+    const int lm_blocks = get_lm_head_blocks();
     if (u.kind == WeightKind::NVFP4) {
         if constexpr (B_CONST >= 2) {
-            launch_pdl(lm_head_nvfp4_mma_stage1_kernel<B_CONST>, dim3(LM_HEAD_BLOCKS), 192, stream,
+            launch_pdl(lm_head_nvfp4_mma_stage1_kernel<B_CONST>, dim3(lm_blocks), 192, stream,
                 static_cast<const uint8_t*>(u.data), u.scales, u.global_scale,
                 x, out_logits, s_val, s_idx, sample_cfg, u.rows, 0u);
         } else {
-            launch_pdl(lm_head_stage1_kernel<B_CONST, 2>, dim3(LM_HEAD_BLOCKS), 256, stream,
+            launch_pdl(lm_head_stage1_kernel<B_CONST, 2>, dim3(lm_blocks), 256, stream,
                 u.data, u.scales, static_cast<const float*>(nullptr), u.global_scale,
                 x, out_logits, s_val, s_idx, sample_cfg, u.rows);
         }
     } else if (u.kind == WeightKind::FP8) {
         if constexpr (B_CONST >= 2) {
-            launch_pdl(lm_head_fp8_mma_stage1_kernel<B_CONST>, dim3(LM_HEAD_BLOCKS), 192, stream,
+            launch_pdl(lm_head_fp8_mma_stage1_kernel<B_CONST>, dim3(lm_blocks), 192, stream,
                 static_cast<const uint8_t*>(u.data), u.row_scales,
                 x, out_logits, s_val, s_idx, sample_cfg, u.rows, 0u);
         } else {
-            launch_pdl(lm_head_stage1_kernel<B_CONST, 1>, dim3(LM_HEAD_BLOCKS), 256, stream,
+            launch_pdl(lm_head_stage1_kernel<B_CONST, 1>, dim3(lm_blocks), 256, stream,
                 u.data, static_cast<const uint8_t*>(nullptr), u.row_scales, 1.0f,
                 x, out_logits, s_val, s_idx, sample_cfg, u.rows);
         }
     } else {
-        lm_head_stage1_kernel<B_CONST, 0><<<LM_HEAD_BLOCKS, 256, 0, stream>>>(
+        lm_head_stage1_kernel<B_CONST, 0><<<lm_blocks, 256, 0, stream>>>(
             u.data, nullptr, nullptr, 1.0f, x, out_logits, s_val, s_idx, sample_cfg, u.rows);
     }
     launch_pdl(lm_head_stage2_argmax_kernel, dim3(B_CONST), 256, stream,
         s_val, s_idx, out_logits, out_toks, sample_cfg, d_pos,
         d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta,
-        inv_draft_vocab, draft_vocab_size, u.rows, B_CONST);
+        inv_draft_vocab, draft_vocab_size, u.rows, B_CONST, lm_blocks);
 }
 
 void launch_lm_head_argmax(
