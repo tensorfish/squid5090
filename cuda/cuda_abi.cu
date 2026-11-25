@@ -14,6 +14,19 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <dlfcn.h>
+
+// CUDA 12.3-12.9 expose the edge-data graph-capture API under _v2/_v3 names; CUDA 13 folded
+// them into the unsuffixed names. The RTX 5080 Laptop driver line (577.x) caps at CUDA 12.9.
+#if CUDART_VERSION < 13000
+#define SQUID_STREAM_GET_CAPTURE_INFO cudaStreamGetCaptureInfo_v3
+#define SQUID_GRAPH_ADD_NODE cudaGraphAddNode_v2
+#define SQUID_STREAM_UPDATE_CAPTURE_DEPS cudaStreamUpdateCaptureDependencies_v2
+#else
+#define SQUID_STREAM_GET_CAPTURE_INFO cudaStreamGetCaptureInfo
+#define SQUID_GRAPH_ADD_NODE cudaGraphAddNode
+#define SQUID_STREAM_UPDATE_CAPTURE_DEPS cudaStreamUpdateCaptureDependencies
+#endif
 
 using namespace squid;
 
@@ -253,6 +266,49 @@ struct CAdaptiveGraph {
 
 } // namespace
 
+namespace {
+
+// Device-level free VRAM from NVML, the figure nvidia-smi reports. Under WDDM (WSL2) cudaMemGetInfo
+// returns the OS residency budget instead: on an idle 16 GiB RTX 5080 Laptop it reads 14.61 GiB free
+// while a 15.0 GiB allocation still runs at full 853 GB/s with ~190 MiB taken by the context.
+struct NvmlMemory {
+    unsigned long long total;
+    unsigned long long free;
+    unsigned long long used;
+};
+using NvmlInitFn = int (*)();
+using NvmlHandleByPciFn = int (*)(const char*, void**);
+using NvmlHandleByIndexFn = int (*)(unsigned int, void**);
+using NvmlMemoryInfoFn = int (*)(void*, NvmlMemory*);
+
+bool nvml_mem_get_info(size_t* free_bytes, size_t* total_bytes) {
+    static void* lib = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) return false;
+    static auto nvml_init = reinterpret_cast<NvmlInitFn>(dlsym(lib, "nvmlInit_v2"));
+    static auto by_pci = reinterpret_cast<NvmlHandleByPciFn>(dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2"));
+    static auto by_index = reinterpret_cast<NvmlHandleByIndexFn>(dlsym(lib, "nvmlDeviceGetHandleByIndex_v2"));
+    static auto mem_info = reinterpret_cast<NvmlMemoryInfoFn>(dlsym(lib, "nvmlDeviceGetMemoryInfo"));
+    if (!nvml_init || !mem_info) return false;
+    static int init_rc = nvml_init();
+    if (init_rc != 0) return false;
+
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    void* handle = nullptr;
+    char bus_id[32] = {};
+    bool found = by_pci && cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), dev) == cudaSuccess &&
+                 by_pci(bus_id, &handle) == 0;
+    if (!found) found = by_index && by_index(static_cast<unsigned int>(dev), &handle) == 0;
+    if (!found) return false;
+    NvmlMemory m{};
+    if (mem_info(handle, &m) != 0) return false;
+    *free_bytes = static_cast<size_t>(m.free);
+    *total_bytes = static_cast<size_t>(m.total);
+    return true;
+}
+
+} // namespace
+
 // Flat C-ABI structs mirrored bit-for-bit in zig/src/cuda.zig!
 extern "C" {
 
@@ -402,6 +458,18 @@ static DsparkWeights to_dw(const CDsparkWeights& c) {
 
 int32_t squid_cuda_malloc(void** ptr, size_t bytes) { return (int32_t)cudaMalloc(ptr, bytes); }
 int32_t squid_cuda_free(void* ptr) { return (int32_t)cudaFree(ptr); }
+int32_t squid_cuda_mem_get_info(size_t* free_bytes, size_t* total_bytes) {
+    // cudaMemGetInfo first: it creates the context, so NVML's figure already excludes it.
+    const cudaError_t err = cudaMemGetInfo(free_bytes, total_bytes);
+    if (err != cudaSuccess) return (int32_t)err;
+    size_t nvml_free = 0;
+    size_t nvml_total = 0;
+    if (nvml_mem_get_info(&nvml_free, &nvml_total)) {
+        *free_bytes = nvml_free;
+        *total_bytes = nvml_total;
+    }
+    return 0;
+}
 int32_t squid_cuda_malloc_host_pinned(void** ptr, size_t bytes, uint8_t mapped) {
     return (int32_t)cudaHostAlloc(ptr, bytes, mapped ? cudaHostAllocMapped : cudaHostAllocDefault);
 }
@@ -812,7 +880,7 @@ int32_t squid_adaptive_graph_create(
     const cudaGraphNode_t* deps = nullptr;
     const cudaGraphEdgeData* edges = nullptr;
     size_t ndeps = 0;
-    err = cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &edges, &ndeps);
+    err = SQUID_STREAM_GET_CAPTURE_INFO(s, &status, nullptr, &g, &deps, &edges, &ndeps);
     if (err != cudaSuccess) {
         cudaGraph_t disc = nullptr; cudaStreamEndCapture(s, &disc);
         cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err;
@@ -824,7 +892,7 @@ int32_t squid_adaptive_graph_create(
     p.conditional.type = cudaGraphCondTypeSwitch;
     p.conditional.size = 3;
     cudaGraphNode_t sw_node = nullptr;
-    err = cudaGraphAddNode(&sw_node, g, deps, edges, ndeps, &p);
+    err = SQUID_GRAPH_ADD_NODE(&sw_node, g, deps, edges, ndeps, &p);
     if (err != cudaSuccess) {
         cudaGraph_t disc = nullptr; cudaStreamEndCapture(s, &disc);
         cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err;
@@ -833,7 +901,7 @@ int32_t squid_adaptive_graph_create(
     ag->bodies[1] = p.conditional.phGraph_out[1];
     ag->bodies[2] = p.conditional.phGraph_out[2];
 
-    err = cudaStreamUpdateCaptureDependencies(s, &sw_node, nullptr, 1, cudaStreamSetCaptureDependencies);
+    err = SQUID_STREAM_UPDATE_CAPTURE_DEPS(s, &sw_node, nullptr, 1, cudaStreamSetCaptureDependencies);
     if (err != cudaSuccess) {
         cudaGraph_t disc = nullptr; cudaStreamEndCapture(s, &disc);
         cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err;

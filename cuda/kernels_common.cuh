@@ -798,4 +798,29 @@ inline void launch_pdl_cluster(
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...));
 }
 
+// Whether `kernel` can run as `cs`-CTA clusters on this GPU. A cluster must fit in one GPC: GB202
+// (RTX 5090) has 16 SMs per GPC, the RTX 5080 Laptop's largest cluster is 10 CTAs, and a launch
+// past the limit fails with cudaErrorInvalidClusterSize.
+template <class Kernel>
+inline bool cluster_size_fits(Kernel kernel, int cs, int grid_x, int grid_y, int block, size_t smem) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(grid_x, grid_y);
+    cfg.blockDim = dim3(block);
+    cfg.dynamicSmemBytes = smem;
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim.x = static_cast<unsigned int>(cs);
+    attr.val.clusterDim.y = 1u;
+    attr.val.clusterDim.z = 1u;
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
+    int clusters = 0;
+    const cudaError_t err = cudaOccupancyMaxActiveClusters(&clusters, (const void*)kernel, &cfg);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    return clusters > 0;
+}
+
 } // namespace squid

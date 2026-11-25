@@ -10,6 +10,8 @@
 > - **[`LITE.md`](LITE.md)** — Plain-English, 3Blue1Brown-style animated guide to GPU roofline optimization, speculative decoding, and geometric Fisher-LDA abliteration.
 > - **[`LEARNINGS.md`](LEARNINGS.md)** — Complete technical reference: CUDA kernels, roofline math, KLD/quality analysis, remaining optimization headroom, and the `uv` abliteration pipeline.
 
+> **Running on a 16 GiB RTX 5080?** See **[`PORT-5080.md`](PORT-5080.md)** (CUDA 12.8+ builds, WSL2, VRAM auto-fit).
+
 ---
 
 ## Benchmarks & Quality (Single RTX 5090, `c=1`)

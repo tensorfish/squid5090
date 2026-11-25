@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const constants = @import("constants.zig");
+const cuda = @import("cuda.zig");
 const engine_mod = @import("engine.zig");
 const server_mod = @import("server.zig");
 const tiger = @import("tiger.zig");
@@ -11,6 +12,10 @@ const weights_mod = @import("weights.zig");
 
 const bench_runs_max: usize = 64;
 const cli_tokens_max: usize = 1_048_576;
+// Cards below this size (RTX 5080 16 GiB) keep the 0.86 GiB BF16 embed table in pinned host RAM.
+const embed_host_auto_below_bytes: u64 = 24 * 1024 * 1024 * 1024;
+// Smallest context the VRAM auto-fit will shrink to before giving up.
+const ctx_fit_min: u32 = 4096;
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     const argv = init.args.vector;
@@ -53,6 +58,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var use_graphs: bool = true;
     var use_prompt_lookup: bool = true;
     var embed_on_host: bool = false;
+    var embed_on_device: bool = false;
+    var ctx_explicit: bool = false;
+    var kv_explicit: bool = false;
+    var mode_explicit: bool = false;
     var raw_prompt: bool = false;
     var raw_thinking: bool = false;
     var keep_history_thinking: bool = false;
@@ -78,9 +87,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--mode") and arg_i + 1 < argv.len) {
             arg_i += 1;
             mode_str = std.mem.span(argv[arg_i]);
+            mode_explicit = true;
         } else if (std.mem.eql(u8, arg, "--kv") and arg_i + 1 < argv.len) {
             arg_i += 1;
             kv_str = std.mem.span(argv[arg_i]);
+            kv_explicit = !std.mem.eql(u8, kv_str, "auto");
         } else if (std.mem.eql(u8, arg, "--host") and arg_i + 1 < argv.len) {
             arg_i += 1;
             host = std.mem.span(argv[arg_i]);
@@ -144,8 +155,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--ctx") and arg_i + 1 < argv.len) {
             arg_i += 1;
             ctx = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 8192;
+            ctx_explicit = true;
         } else if (std.mem.eql(u8, arg, "--embed-host")) {
             embed_on_host = true;
+        } else if (std.mem.eql(u8, arg, "--embed-device")) {
+            embed_on_device = true;
         } else if (std.mem.eql(u8, arg, "--no-graph")) {
             use_graphs = false;
         } else if (std.mem.eql(u8, arg, "--no-prompt-lookup")) {
@@ -203,8 +217,22 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     defer if (need_tokenizer) tokenizer.deinit();
 
-    const quant_mode: constants.QuantMode = parse_mode(mode_str);
-    const kv_format: constants.KVFormat = if (std.mem.eql(u8, kv_str, "bf16"))
+    var quant_mode: constants.QuantMode = parse_mode(mode_str);
+    // 16 GiB cards: the fp8 (serve) and exact (generate/bench) defaults need more VRAM than the
+    // card has for weights alone, so an unset --mode falls back to nvfp4.
+    if (!mode_explicit and quant_mode != .nvfp4) {
+        var free_bytes: usize = 0;
+        var device_bytes: usize = 0;
+        tiger.assert_cuda(cuda.squid_cuda_mem_get_info(&free_bytes, &device_bytes));
+        if (device_bytes < embed_host_auto_below_bytes) {
+            tiger.print_stdout(
+                "[vram] {d:.1} GiB card: --mode nvfp4 (the {s} default does not fit; pass --mode to override)\n",
+                .{ @as(f64, @floatFromInt(device_bytes)) / (1024.0 * 1024.0 * 1024.0), mode_str },
+            );
+            quant_mode = .nvfp4;
+        }
+    }
+    var kv_format: constants.KVFormat = if (std.mem.eql(u8, kv_str, "bf16"))
         .bf16
     else if (std.mem.eql(u8, kv_str, "fp8"))
         .fp8
@@ -219,6 +247,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     if (ctx > 524_288 and quant_mode != .exact) {
         embed_on_host = true;
+    }
+
+    // 16 GiB cards: the nvfp4 weights alone are 14.57 GiB with the embed table on the GPU.
+    if (quant_mode != .exact and !embed_on_host and !embed_on_device) {
+        var free_bytes: usize = 0;
+        var device_bytes: usize = 0;
+        tiger.assert_cuda(cuda.squid_cuda_mem_get_info(&free_bytes, &device_bytes));
+        if (device_bytes < embed_host_auto_below_bytes) {
+            embed_on_host = true;
+            tiger.print_stdout(
+                "[vram] {d:.1} GiB card: embed table in pinned host RAM (--embed-device to keep it on the GPU)\n",
+                .{@as(f64, @floatFromInt(device_bytes)) / (1024.0 * 1024.0 * 1024.0)},
+            );
+        }
     }
 
     const prompt_ids_buf = tiger.alloc_host_zeroed(i32, cli_tokens_max);
@@ -273,6 +315,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const load_mtp: bool = (mtp > 0 or std.mem.eql(u8, command, "bench") or std.mem.eql(u8, command, "longctx") or std.mem.eql(u8, command, "serve"));
     if (!model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host, ablation_path)) return 1;
     defer model_weights.deinit();
+
+    if (!fit_runtime_to_vram(&ctx, &kv_format, ctx_explicit, kv_explicit, model_weights.dspark.loaded != 0)) return 1;
 
     var engine: engine_mod.Engine = .{};
     engine.init(&model_weights, ctx, use_graphs, kv_format);
@@ -678,6 +722,68 @@ fn print_decoded(tok: *const tokenizer_mod.Tokenizer, tokens: []const i32) void 
     tiger.write_fd_all(1, "\n----------------------\n");
 }
 
+/// Shrink the requested context (and switch auto fp8 KV to q4) until the runtime arena fits
+/// in free VRAM minus the reserve. An explicit --ctx/--kv that does not fit is an error,
+/// never a silent change.
+fn fit_runtime_to_vram(
+    ctx: *u32,
+    kv_format: *constants.KVFormat,
+    ctx_explicit: bool,
+    kv_explicit: bool,
+    has_dspark: bool,
+) bool {
+    const gib: f64 = 1024.0 * 1024.0 * 1024.0;
+    var free_bytes: usize = 0;
+    var device_bytes: usize = 0;
+    tiger.assert_cuda(cuda.squid_cuda_mem_get_info(&free_bytes, &device_bytes));
+    const reserve_bytes: u64 = weights_mod.vram_reserve_bytes();
+    const budget: u64 = if (free_bytes > reserve_bytes) free_bytes - reserve_bytes else 0;
+
+    const requested_ctx: u32 = ctx.*;
+    const requested_kv: constants.KVFormat = kv_format.*;
+    if (engine_mod.runtime_vram_bytes_for(ctx.*, kv_format.*, has_dspark) <= budget) return true;
+
+    if (!kv_explicit and kv_format.* == .fp8) {
+        kv_format.* = .q4;
+    }
+    if (engine_mod.runtime_vram_bytes_for(ctx.*, kv_format.*, has_dspark) > budget) {
+        if (ctx_explicit or ctx.* <= ctx_fit_min or
+            engine_mod.runtime_vram_bytes_for(ctx_fit_min, kv_format.*, has_dspark) > budget)
+        {
+            tiger.print_stderr(
+                "[vram] Runtime for ctx={d} kv={s} needs {d:.2} GiB, only {d:.2} GiB free after weights and {d:.2} GiB reserve (of {d:.2} GiB). Lower --ctx, use --kv q4, build with -Dprefill-batch=1024, or free VRAM.\n",
+                .{
+                    ctx.*,
+                    kv_format.*.name(),
+                    @as(f64, @floatFromInt(engine_mod.runtime_vram_bytes_for(ctx.*, kv_format.*, has_dspark))) / gib,
+                    @as(f64, @floatFromInt(budget)) / gib,
+                    @as(f64, @floatFromInt(reserve_bytes)) / gib,
+                    @as(f64, @floatFromInt(device_bytes)) / gib,
+                },
+            );
+            return false;
+        }
+        // Largest multiple of 1024 tokens in [ctx_fit_min, requested] that fits (runtime bytes grow with ctx).
+        var lo: u32 = ctx_fit_min / 1024;
+        var hi: u32 = ctx.* / 1024;
+        while (lo < hi) {
+            const mid: u32 = lo + (hi - lo + 1) / 2;
+            if (engine_mod.runtime_vram_bytes_for(mid * 1024, kv_format.*, has_dspark) <= budget) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        ctx.* = lo * 1024;
+    }
+    tiger.assert(engine_mod.runtime_vram_bytes_for(ctx.*, kv_format.*, has_dspark) <= budget);
+    tiger.print_stdout(
+        "[vram] Fitted to {d:.2} GiB free: ctx {d} -> {d}, kv {s} -> {s}\n",
+        .{ @as(f64, @floatFromInt(budget)) / gib, requested_ctx, ctx.*, requested_kv.name(), kv_format.*.name() },
+    );
+    return true;
+}
+
 fn print_usage() void {
     tiger.write_fd_all(2,
         "squid5090 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
@@ -688,6 +794,9 @@ fn print_usage() void {
             "  squid5090 longctx  <model_dir> [--mode exact|fp8|nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
             "  squid5090 logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode exact] [--kv bf16] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ctx 8192]\n" ++
             "  squid5090 kld      <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref FILE [--mode exact|fp8|nvfp4] [--kv auto|bf16|fp8|q4] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ctx 8192]\n" ++
-            "  squid5090 tokenize <model_dir> (--prompt TEXT | --prompt-file PATH) [--raw]\n",
+            "  squid5090 tokenize <model_dir> (--prompt TEXT | --prompt-file PATH) [--raw]\n\n" ++
+            "VRAM: on cards under 24 GiB the embed table goes to pinned host RAM (--embed-device / --embed-host override).\n" ++
+            "Without an explicit --ctx/--kv, context shrinks and auto KV switches fp8 -> q4 until the runtime fits;\n" ++
+            "SQUID_VRAM_RESERVE_MIB (default 384) is left free. Loads that would overcommit VRAM exit instead of paging.\n",
     );
 }

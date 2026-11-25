@@ -181,10 +181,34 @@ pub const ModelWeights = struct {
             has_ablation,
             has_ablation_detectors,
         );
-        self.arena = vram_arena.VRAMArena.init(total_vram_bytes);
-
         // Temporary staging buffers on GPU for BF16 upload & quantization (freed before returning)
         const stage_bytes: u64 = @as(u64, constants.vocab_unpadded_count) * constants.hidden_dim * 2;
+
+        // Refuse to load rather than overcommit: under WDDM (Windows, WSL2) a cudaMalloc past
+        // physical VRAM succeeds and silently pages to system RAM at a fraction of the bandwidth.
+        const reserve_bytes: u64 = vram_reserve_bytes();
+        var free_bytes: usize = 0;
+        var device_bytes: usize = 0;
+        tiger.assert_cuda(cuda.squid_cuda_mem_get_info(&free_bytes, &device_bytes));
+        if (total_vram_bytes + stage_bytes + reserve_bytes > free_bytes) {
+            const gib: f64 = 1024.0 * 1024.0 * 1024.0;
+            tiger.print_stderr(
+                "[weights] Not enough free VRAM: mode={s} embed_host={s} needs {d:.2} GiB weights + {d:.2} GiB load staging + {d:.2} GiB reserve, {d:.2} of {d:.2} GiB free\n",
+                .{
+                    quant_mode.name(),
+                    if (embed_on_host) "on" else "off",
+                    @as(f64, @floatFromInt(total_vram_bytes)) / gib,
+                    @as(f64, @floatFromInt(stage_bytes)) / gib,
+                    @as(f64, @floatFromInt(reserve_bytes)) / gib,
+                    @as(f64, @floatFromInt(free_bytes)) / gib,
+                    @as(f64, @floatFromInt(device_bytes)) / gib,
+                },
+            );
+            return false;
+        }
+
+        self.arena = vram_arena.VRAMArena.init(total_vram_bytes);
+
         var d_stage_opt: ?*anyopaque = null;
         tiger.assert_cuda(cuda.squid_cuda_malloc(&d_stage_opt, @intCast(stage_bytes)));
         const d_stage: *anyopaque = d_stage_opt.?;
@@ -926,6 +950,17 @@ fn try_load_draft_vocab(model_directory: []const u8, quant_mode: constants.Quant
         tiger.free_host_slice(i32, ids);
     }
     return null;
+}
+
+/// VRAM left unallocated for the CUDA context, cuBLAS workspaces and graph instantiation
+/// (SQUID_VRAM_RESERVE_MIB, default 384 MiB).
+pub fn vram_reserve_bytes() u64 {
+    const default_mib: u64 = 384;
+    const mib: u64 = if (tiger.getenv("SQUID_VRAM_RESERVE_MIB")) |raw|
+        std.fmt.parseInt(u64, std.mem.span(raw), 10) catch default_mib
+    else
+        default_mib;
+    return mib * 1024 * 1024;
 }
 
 /// Pass 1: exact 256-byte-aligned VRAM byte accounting matching Pass 2 allocation-for-allocation.

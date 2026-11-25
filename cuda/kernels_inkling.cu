@@ -2850,6 +2850,11 @@ static void dispatch_ctrl_cluster_bf16(
         CUDA_CHECK(cudaFuncSetAttribute(
             controller_cluster_bf16_kernel<B_CONST>,
             cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+        if (!cluster_size_fits(controller_cluster_bf16_kernel<B_CONST>, CTRL_CL, CTRL_CL, 1, 256, CTRL_DYN_SMEM)) {
+            fprintf(stderr, "[cuda] the BF16 cluster controller (fp8/exact modes) needs %d-CTA clusters, which this GPU "
+                            "cannot schedule; use --mode nvfp4\n", CTRL_CL);
+            abort();
+        }
         attr_set = true;
     }
     launch_pdl_cluster(
@@ -2867,6 +2872,11 @@ static void dispatch_router_cluster_bf16(
         CUDA_CHECK(cudaFuncSetAttribute(
             router_cluster_bf16_kernel<B_CONST>,
             cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+        if (!cluster_size_fits(router_cluster_bf16_kernel<B_CONST>, 16, 16, 1, 256, 0)) {
+            fprintf(stderr, "[cuda] the BF16 cluster router (fp8/exact modes) needs 16-CTA clusters, which this GPU "
+                            "cannot schedule; use --mode nvfp4\n");
+            abort();
+        }
         attr_set = true;
     }
     launch_pdl_cluster(
@@ -3890,9 +3900,8 @@ attn_cluster_decode_kernel(const AttnClusterParams p) {
     }
 }
 
-template <int M, bool FULL, int KV_FMT>
-static void dispatch_attn_cluster_inst(const AttnClusterParams& p, cudaStream_t stream) {
-    constexpr int CS = FULL ? 16 : 8;
+template <int M, bool FULL, int KV_FMT, int CS>
+static void set_attn_cluster_attrs() {
     constexpr size_t SMEM_BYTES = AttnClusterSmem<M, CS>::BYTES;
     static bool attr_set = false;
     if (!attr_set) {
@@ -3909,9 +3918,35 @@ static void dispatch_attn_cluster_inst(const AttnClusterParams& p, cudaStream_t 
         }
         attr_set = true;
     }
+}
+
+template <int M, bool FULL, int KV_FMT, int CS>
+static void dispatch_attn_cluster_cs(const AttnClusterParams& p, cudaStream_t stream) {
+    constexpr size_t SMEM_BYTES = AttnClusterSmem<M, CS>::BYTES;
+    set_attn_cluster_attrs<M, FULL, KV_FMT, CS>();
     launch_pdl_cluster(
         attn_cluster_decode_kernel<M, FULL, KV_FMT, CS>,
         dim3(CS, NUM_KV_HEADS), AC_NT, static_cast<int>(SMEM_BYTES), CS, stream, p);
+}
+
+// Global-attention layers use 16-CTA clusters where the GPU allows them and fall back to the 8-CTA
+// shape the local layers use (the kernel is generic in CS).
+template <int M, bool FULL, int KV_FMT>
+static void dispatch_attn_cluster_inst(const AttnClusterParams& p, cudaStream_t stream) {
+    if constexpr (FULL) {
+        static const bool wide = [] {
+            set_attn_cluster_attrs<M, true, KV_FMT, 16>();
+            return cluster_size_fits(attn_cluster_decode_kernel<M, true, KV_FMT, 16>, 16, 16, NUM_KV_HEADS, AC_NT,
+                                     AttnClusterSmem<M, 16>::BYTES);
+        }();
+        if (wide) {
+            dispatch_attn_cluster_cs<M, true, KV_FMT, 16>(p, stream);
+        } else {
+            dispatch_attn_cluster_cs<M, true, KV_FMT, 8>(p, stream);
+        }
+    } else {
+        dispatch_attn_cluster_cs<M, false, KV_FMT, 8>(p, stream);
+    }
 }
 
 template <bool FULL, int KV_FMT>

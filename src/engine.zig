@@ -121,9 +121,9 @@ const PromptLookupIndex = struct {
 
 const prefix_checkpoint_count: usize = 4;
 const side_shield_max_tokens: u32 = 4096;
-const prefill_batch_max: u32 = 2048;
-const prefill_local_attn_sub: u32 = 2048;
-const prefill_sub_chunks_max: u32 = prefill_batch_max / constants.mtp_block_size_max; // 256
+const prefill_batch_max: u32 = @import("build_options").prefill_batch_max;
+const prefill_local_attn_sub: u32 = prefill_batch_max;
+const prefill_sub_chunks_max: u32 = prefill_batch_max / constants.mtp_block_size_max; // 256 at -Dprefill-batch=2048
 
 inline fn offset_f16_ptr(base: *anyopaque, elem_offset: usize) *anyopaque {
     const bytes: [*]u8 = @ptrCast(base);
@@ -2794,6 +2794,23 @@ pub const Engine = struct {
         self.adaptive_graph_threshold = self.spec_threshold;
     }
 };
+
+/// Runtime arena bytes Engine.init would allocate for this configuration
+/// (lets the CLI fit context and KV format to free VRAM before allocating).
+pub fn runtime_vram_bytes_for(
+    context_tokens_max: u32,
+    kv_format: constants.KVFormat,
+    has_dspark: bool,
+) u64 {
+    const schedule = constants.build_visit_schedule();
+    return compute_runtime_vram_bytes(
+        &schedule,
+        context_tokens_max,
+        kv_format,
+        has_dspark,
+        cuda.squid_sizeof_expert_groups(),
+    );
+}
 
 fn compute_runtime_vram_bytes(
     schedule: *const [constants.visit_count]constants.VisitInfo,

@@ -27,6 +27,20 @@ pub fn build(b: *std.Build) void {
         "CUDA toolkit root directory (default: /usr/local/cuda)",
     ) orelse "/usr/local/cuda";
 
+    // Rows per batched-prefill chunk. Every prefill scratch buffer scales with it
+    // (~0.7 GiB at 2048). 16 GiB cards (RTX 5080) can trade prefill speed for KV
+    // capacity with -Dprefill-batch=1024 (0.34 GiB less runtime VRAM).
+    const prefill_batch = b.option(
+        u32,
+        "prefill-batch",
+        "Max tokens per batched prefill chunk: 512, 1024 or 2048 (default: 2048)",
+    ) orelse 2048;
+    if (prefill_batch != 512 and prefill_batch != 1024 and prefill_batch != 2048) {
+        std.debug.panic("-Dprefill-batch must be 512, 1024 or 2048 (got {d})", .{prefill_batch});
+    }
+    const build_options = b.addOptions();
+    build_options.addOption(u32, "prefill_batch_max", prefill_batch);
+
     const nvcc_bin = b.fmt("{s}/bin/nvcc", .{cuda_path});
     const cuda_lib = b.fmt("{s}/lib64", .{cuda_path});
     const gencode = b.fmt("arch=compute_{s},code=sm_{s}", .{ cuda_arch, cuda_arch });
@@ -37,6 +51,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    root_module.addOptions("build_options", build_options);
 
     // Compile all 5 Blackwell CUDA translation units in parallel with full
     // content-addressed Zig caching (including header dependency tracking).
@@ -84,6 +99,7 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("stdc++", .{});
     root_module.linkSystemLibrary("m", .{});
     root_module.linkSystemLibrary("pthread", .{});
+    root_module.linkSystemLibrary("dl", .{}); // dlopen(libnvidia-ml.so.1) for device-level free VRAM
 
     const exe = b.addExecutable(.{
         .name = "squid5090",
